@@ -50,6 +50,7 @@ async function route(request, env, ctx, url) {
   if (pathname === '/playlists' && method === 'PUT') return putPlaylists(request, env);
   if (pathname === '/telegram/setup' && method === 'POST') return setupTelegram(env, url);
   if (pathname === '/covers/find-missing' && method === 'POST') return findMissingCovers(env);
+  if (pathname === '/genres/find-missing' && method === 'POST') return findMissingGenres(env);
   if (pathname === '/artist-photos/find' && method === 'POST') return findArtistPhotos(request, env);
   if (pathname === '/artist-photo' && method === 'GET') return getArtistPhoto(url, env);
   if (pathname === '/artist-photo' && method === 'PUT') return setArtistPhoto(request, env);
@@ -91,7 +92,7 @@ async function ensureSchema(env) {
     env.DB.prepare('CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)'),
   ]);
   // Columns added after the first release (ignore "duplicate column" errors).
-  for (const col of ['cover_file_id TEXT', 'cover_url TEXT', 'cover_checked INTEGER']) {
+  for (const col of ['cover_file_id TEXT', 'cover_url TEXT', 'cover_checked INTEGER', 'genre TEXT', 'genre_checked INTEGER', 'features TEXT']) {
     try { await env.DB.prepare(`ALTER TABLE tracks ADD COLUMN ${col}`).run(); } catch {}
   }
   schemaReady = true;
@@ -110,11 +111,11 @@ function setKV(env, key, value) {
 const getTgConfig = (env) => getKV(env, 'telegram', { ownerIds: [] });
 
 function insertTrack(env, t) {
-  return env.DB.prepare(`INSERT INTO tracks (id, title, artist, duration, size, type, added_at, source, file_id, file_unique_id, chat_id, message_id, cover_file_id, cover_url, cover_checked)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+  return env.DB.prepare(`INSERT INTO tracks (id, title, artist, duration, size, type, added_at, source, file_id, file_unique_id, chat_id, message_id, cover_file_id, cover_url, cover_checked, genre, genre_checked)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`)
     .bind(t.id, t.title, t.artist || '', t.duration || 0, t.size || 0, t.type, t.addedAt, t.source,
       t.fileId, t.fileUniqueId || null, t.chatId != null ? String(t.chatId) : null, t.messageId ?? null,
-      t.coverFileId || null, t.coverUrl || null, t.coverChecked ? 1 : null)
+      t.coverFileId || null, t.coverUrl || null, t.coverChecked ? 1 : null, t.genre || null)
     .run();
 }
 
@@ -124,7 +125,14 @@ const toTrack = (r) => ({
   id: r.id, title: r.title, artist: r.artist, duration: r.duration, size: r.size,
   type: r.type, addedAt: r.added_at, source: r.source,
   cover: coverKey(r),
+  genre: r.genre || '',
+  features: parseFeatures(r.features),
 });
+
+function parseFeatures(f) {
+  if (!f) return null;
+  try { return typeof f === 'string' ? JSON.parse(f) : f; } catch { return null; }
+}
 
 // A short key that changes whenever the cover changes, so the app knows to refetch it.
 function coverKey(r) {
@@ -219,8 +227,10 @@ async function uploadTrack(request, env) {
     chatId: target, messageId: msg.message_id,
     coverFileId: file.thumbnail?.file_id || null,
   };
+  const match = await lookupMatch(artist, title).catch(() => null);
+  track.genre = match?.genre || null;
   if (!track.coverFileId) {
-    track.coverUrl = await lookupCover(artist, title).catch(() => null);
+    track.coverUrl = match?.art || null;
     track.coverChecked = true;
   }
   await insertTrack(env, track);
@@ -246,8 +256,12 @@ async function updateTrack(id, request, env) {
   const title = clean(body.title) || row.title;
   const artist = body.artist !== undefined ? clean(body.artist, 60) : row.artist;
   const duration = !row.duration && Number(body.duration) ? Number(body.duration) : row.duration;
-  await env.DB.prepare('UPDATE tracks SET title = ?, artist = ?, duration = ? WHERE id = ?').bind(title, artist, duration, id).run();
-  return json(toTrack({ ...row, title, artist, duration }));
+  const genre = body.genre !== undefined ? clean(body.genre, 40) : row.genre;
+  let features = row.features;
+  if (body.features && typeof body.features === 'object') features = JSON.stringify(body.features).slice(0, 500);
+  await env.DB.prepare('UPDATE tracks SET title = ?, artist = ?, duration = ?, genre = ?, genre_checked = 1, features = ? WHERE id = ?')
+    .bind(title, artist, duration, genre || null, features || null, id).run();
+  return json(toTrack({ ...row, title, artist, duration, genre, features }));
 }
 
 // ---------- cover art ----------
@@ -294,6 +308,20 @@ async function findMissingCovers(env) {
     const url = await lookupCover(r.artist, r.title).catch(() => null);
     if (url) found++;
     await env.DB.prepare('UPDATE tracks SET cover_url = ?, cover_checked = 1 WHERE id = ?').bind(url, r.id).run();
+  }
+  const left = await env.DB.prepare(`SELECT COUNT(*) AS n FROM tracks WHERE ${where}`).first();
+  return json({ checked: results.length, found, remaining: left.n });
+}
+
+// Fills in genres for songs added before genres existed (the app calls this until remaining is 0).
+async function findMissingGenres(env) {
+  const where = 'genre_checked IS NULL';
+  const { results } = await env.DB.prepare(`SELECT id, title, artist FROM tracks WHERE ${where} LIMIT 6`).all();
+  let found = 0;
+  for (const r of results) {
+    const m = await lookupMatch(r.artist, r.title).catch(() => null);
+    if (m?.genre) found++;
+    await env.DB.prepare('UPDATE tracks SET genre = COALESCE(genre, ?), genre_checked = 1 WHERE id = ?').bind(m?.genre || null, r.id).run();
   }
   const left = await env.DB.prepare(`SELECT COUNT(*) AS n FROM tracks WHERE ${where}`).first();
   return json({ checked: results.length, found, remaining: left.n });
@@ -409,6 +437,7 @@ async function searchCatalog(query, limit = 25, { itunes = true, deezer = true }
       .then((d) => (d.results || []).filter((r) => r.artworkUrl100).map((r) => ({
         title: r.trackName, artist: r.artistName, album: r.collectionName,
         art: r.artworkUrl100.replace(/\/\d+x\d+bb\./, '/600x600bb.'),
+        genre: r.primaryGenreName || '',
       })))
       .catch(() => []));
   }
@@ -428,6 +457,10 @@ async function searchCatalog(query, limit = 25, { itunes = true, deezer = true }
 // "Sweet Child O' Mine", "guns and roses" finds "Guns N' Roses"), but both the
 // artist AND the title must be close, so unreleased songs don't get a random cover.
 async function lookupCover(artist, title) {
+  return (await lookupMatch(artist, title))?.art || null;
+}
+
+async function lookupMatch(artist, title) {
   let a = artist;
   let t = title;
   if (!a && / - /.test(t)) [a, t] = t.split(/ - (.*)/s); // "Artist - Song" titles
@@ -472,7 +505,10 @@ async function lookupCover(artist, title) {
     const sc = score(c);
     if (sc > bestScore) { best = c; bestScore = sc; }
   }
-  return best?.art || null;
+  if (!best) return null;
+  // Deezer results have no genre; borrow it from an Apple Music result for the same song.
+  const genre = best.genre || lists.flat().find((c) => c.genre && score(c) > 0)?.genre || '';
+  return { art: best.art, genre };
 }
 
 function norm(s) {
@@ -665,7 +701,8 @@ async function addFromMessage(env, msg, cfg, { source, archive }) {
 
   const artist = clean(file.performer, 60);
   const coverFileId = file.thumbnail?.file_id || file.thumb?.file_id || null;
-  const coverUrl = coverFileId ? null : await lookupCover(artist, title).catch(() => null);
+  const match = await lookupMatch(artist, title).catch(() => null);
+  const coverUrl = coverFileId ? null : match?.art || null;
 
   await insertTrack(env, {
     id: crypto.randomUUID(),
@@ -674,6 +711,7 @@ async function addFromMessage(env, msg, cfg, { source, archive }) {
     coverFileId,
     coverUrl,
     coverChecked: true,
+    genre: match?.genre || null,
     duration: file.duration || 0,
     size: file.file_size || 0,
     type,

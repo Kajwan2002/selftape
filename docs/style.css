@@ -350,3 +350,25 @@ body.has-mini .view { padding-bottom: calc(var(--tabs-h) + var(--mini-h) + var(-
 
 .cover-grid.round .cover-opt img { border-radius: 50%; }
 .cover-grid.round .cover-opt { text-align: center; }
+
+/* "Made for you" mix tiles */
+.recent-item.mix-item { width: 136px; }
+.art.mix {
+  position: relative; overflow: hidden; place-items: end start; text-shadow: none;
+  background: linear-gradient(150deg, hsl(var(--h) 70% 52%), hsl(calc(var(--h) + 40) 65% 22%));
+}
+.recent-item.mix-item .art.mix { width: 136px; height: 136px; }
+.art.mix .mix-covers {
+  position: absolute; inset: 0; display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr;
+  opacity: .55; mix-blend-mode: luminosity;
+}
+.art.mix .mix-covers > div { background-size: cover; background-position: center; }
+.art.mix::after {
+  content: ""; position: absolute; inset: 0;
+  background: linear-gradient(180deg, transparent 35%, hsl(var(--h) 60% 18% / .9));
+}
+.art.mix .mix-label {
+  position: relative; z-index: 1; padding: 0 10px 9px; font-size: 19px; font-weight: 800;
+  letter-spacing: -.02em; line-height: 1.05; color: #fff; text-align: left;
+}
+.art.mix.big .mix-label { font-size: 17px; padding: 0 8px 7px; }

@@ -48,7 +48,11 @@ export const uploadTrack = async (s, t, blob) =>
   })).json();
 
 export const updateTrack = (s, t) =>
-  call(s, `/tracks/${t.id}`, { method: 'PATCH', ...jsonBody({ title: t.title, artist: t.artist, duration: t.duration }) });
+  call(s, `/tracks/${t.id}`, { method: 'PATCH', ...jsonBody({ title: t.title, artist: t.artist, duration: t.duration, genre: t.genre || '' }) });
+
+export const saveFeatures = (s, id, features) => call(s, `/tracks/${id}`, { method: 'PATCH', ...jsonBody({ features }) });
+
+export const findMissingGenres = async (s) => (await call(s, '/genres/find-missing', { method: 'POST' })).json();
 
 export const deleteTrack = (s, id) => call(s, `/tracks/${id}`, { method: 'DELETE' });
 

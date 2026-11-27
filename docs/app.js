@@ -3,7 +3,7 @@ import * as api from './api.js';
 import { player } from './player.js';
 import { icon } from './icons.js';
 
-const APP_VERSION = 'v11'; // keep in sync with VERSION in sw.js
+const APP_VERSION = 'v12'; // keep in sync with VERSION in sw.js
 
 // ---------- helpers ----------
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -379,6 +379,14 @@ async function enforceStorageLimit(keepId) {
   refreshStorageInfo();
 }
 
+// A play counts once you've listened for 30 seconds (for "On repeat").
+function countPlay(id) {
+  const t = state.tracks.get(id);
+  if (!t) return;
+  t.plays = [...(t.plays || []), Date.now()].slice(-30);
+  db.put('tracks', t);
+}
+
 function markPlayed(id) {
   const t = state.tracks.get(id);
   if (!t) return;
@@ -456,6 +464,7 @@ async function importFiles(files) {
   toast(count ? `Imported ${plural(count, 'track')}` : 'No audio files found');
   renderView();
   scheduleSync(300);
+  analyzeLibrary();
 }
 
 async function removeTrackLocally(id) {
@@ -558,8 +567,9 @@ async function sync(manual = false) {
       serverIds.add(st.id);
       if (p.renames.includes(st.id)) continue;
       const lt = state.tracks.get(st.id);
-      const merged = { ...lt, ...st, duration: st.duration || lt?.duration || 0 };
-      if (!lt || lt.title !== merged.title || lt.artist !== merged.artist || lt.duration !== merged.duration || lt.size !== merged.size || lt.cover !== merged.cover) {
+      const merged = { ...lt, ...st, duration: st.duration || lt?.duration || 0, features: st.features || lt?.features || null };
+      if (!lt || lt.title !== merged.title || lt.artist !== merged.artist || lt.duration !== merged.duration || lt.size !== merged.size
+        || lt.cover !== merged.cover || (lt.genre || '') !== (merged.genre || '') || !!lt.features !== !!merged.features) {
         state.tracks.set(st.id, merged);
         await db.put('tracks', merged);
         changed = true;
@@ -577,7 +587,9 @@ async function sync(manual = false) {
     }
     if (uploadProblem) state.syncError = uploadProblem;
     if (changed) renderView();
-    if (s.autoDownload) backgroundDownload();
+    if (s.autoDownload) backgroundDownload().then(analyzeLibrary);
+    else analyzeLibrary();
+    fillGenres();
     if (manual) toast('Synced');
   } catch (err) {
     state.syncError = err.message;
@@ -597,7 +609,7 @@ function render() {
 }
 
 function renderTabs() {
-  const active = state.view.name === 'playlist' ? 'playlists' : state.view.name === 'artist' ? 'library' : state.view.name;
+  const active = state.view.name === 'playlist' ? 'playlists' : ['artist', 'mix'].includes(state.view.name) ? 'library' : state.view.name;
   $('#importBtn').hidden = state.view.name !== 'library';
   $$('.tabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === active));
 }
@@ -614,6 +626,13 @@ function renderView() {
     $('#pageTitle').textContent = 'Playlists';
     el.innerHTML = playlistsHTML();
     hydrateCovers(el);
+  } else if (v.name === 'mix') {
+    const mix = findMix(v.id);
+    if (!mix) { state.view = { name: 'library' }; return renderView(); }
+    $('#pageTitle').textContent = 'Library';
+    el.innerHTML = mixHTML(mix);
+    hydrateCovers(el);
+    renderList();
   } else if (v.name === 'artist') {
     const a = artistIndex().get(v.key);
     if (!a) { state.view = { name: 'library' }; state.libTab = 'artists'; return renderView(); }
@@ -653,6 +672,7 @@ function libraryHTML() {
       <button data-action="lib-tab" data-lib="songs" class="${songs ? 'on' : ''}">Songs</button>
       <button data-action="lib-tab" data-lib="artists" class="${songs ? '' : 'on'}">Artists</button>
     </div>
+    <div id="mixes"></div>
     <div id="recent"></div>
     ${songs ? `<div class="actions-row">
       <button class="pill primary" data-action="play-list">${icon('play')} Play</button>
@@ -781,6 +801,268 @@ function artistHTML(a) {
     <div id="list" class="list"></div>`;
 }
 
+// ---------- genres ----------
+function knownGenres() {
+  return [...new Set([...state.tracks.values()].map((t) => (t.genre || '').trim()).filter(Boolean))].sort();
+}
+
+// Group similar genre names ("Hard Rock" + "Rock", "Hip-Hop/Rap" + "Rap") into one mix.
+function genreFamily(g) {
+  const s = String(g || '').toLowerCase();
+  if (!s) return '';
+  if (/metal|core\b|metalcore|deathcore/.test(s)) return 'Metal';
+  if (/hip.?hop|rap|trap|drill/.test(s)) return 'Hip-Hop';
+  if (/r&b|rnb|soul|funk/.test(s)) return 'R&B';
+  if (/electro|dance|house|techno|edm|trance|dubstep|drum.?n|dnb/.test(s)) return 'Electronic';
+  if (/punk/.test(s)) return 'Punk';
+  if (/rock|grunge|alternative|indie/.test(s)) return 'Rock';
+  if (/lo.?fi|chill|ambient/.test(s)) return 'Chill';
+  if (/jazz|blues/.test(s)) return 'Jazz';
+  if (/classical|piano|orchestra|soundtrack/.test(s)) return 'Classical';
+  if (/singer|songwriter|acoustic|folk/.test(s)) return 'Acoustic';
+  if (/pop/.test(s)) return 'Pop';
+  return g.trim().replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+// Ask the server to fill in genres for older songs (once per app start, in the background).
+let genresFilled = false;
+async function fillGenres() {
+  if (genresFilled || !configured() || !navigator.onLine) return;
+  genresFilled = true;
+  try {
+    let found = 0;
+    for (let i = 0; i < 100; i++) {
+      const r = await api.findMissingGenres(state.settings);
+      found += r.found;
+      if (!r.remaining || !r.checked) break;
+    }
+    if (found) scheduleSync(500);
+  } catch {}
+}
+
+// ---------- listening to the songs (tempo, energy) ----------
+// Runs in the background on songs that are on this device; the result is
+// shared through the server so other devices don't need to redo it.
+const ANALYSIS_VERSION = 1;
+let analyzing = false;
+async function analyzeLibrary() {
+  if (analyzing) return;
+  analyzing = true;
+  let did = 0;
+  try {
+    for (const t of [...state.tracks.values()]) {
+      if (t.features?.v === ANALYSIS_VERSION || !state.downloaded.has(t.id)) continue;
+      if (document.hidden) await new Promise((r) => document.addEventListener('visibilitychange', r, { once: true }));
+      const blob = await db.get('blobs', t.id);
+      if (!blob) continue;
+      const features = await analyzeAudio(blob).catch(() => null);
+      if (!features) { t.features = { v: ANALYSIS_VERSION, failed: true }; await db.put('tracks', t); continue; }
+      t.features = features;
+      await db.put('tracks', t);
+      did++;
+      if (configured() && cloudCopy(t.id)) api.saveFeatures(state.settings, t.id, features).catch(() => {});
+      await new Promise((r) => setTimeout(r, 300)); // stay light
+      if (did % 5 === 0) renderMixes();
+    }
+  } finally {
+    analyzing = false;
+    if (did) renderMixes();
+  }
+}
+
+async function analyzeAudio(blob) {
+  const SR = 11025;
+  const Ctx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  const ctx = new Ctx(1, SR, SR);
+  const audio = await ctx.decodeAudioData(await blob.arrayBuffer());
+  // mono mix of up to 2 minutes from the middle of the song
+  const total = audio.length;
+  const len = Math.min(total, SR * 120);
+  const start = Math.max(0, Math.floor((total - len) / 2));
+  const x = new Float32Array(len);
+  for (let c = 0; c < audio.numberOfChannels; c++) {
+    const d = audio.getChannelData(c);
+    for (let i = 0; i < len; i++) x[i] += d[start + i] / audio.numberOfChannels;
+  }
+  // loudness, brightness (zero crossings), per-frame energy
+  const F = 256;
+  const frames = Math.floor(len / F);
+  if (frames < 200) return null;
+  const e = new Float32Array(frames);
+  let sum = 0;
+  let zc = 0;
+  for (let f = 0; f < frames; f++) {
+    let fe = 0;
+    for (let i = f * F; i < (f + 1) * F; i++) {
+      fe += x[i] * x[i];
+      if (i && (x[i] >= 0) !== (x[i - 1] >= 0)) zc++;
+    }
+    e[f] = Math.sqrt(fe / F);
+    sum += fe;
+  }
+  const rms = Math.sqrt(sum / (frames * F));
+  const energy = 20 * Math.log10(rms + 1e-9);
+  const zcr = zc / (frames * F);
+  const mean = e.reduce((a, b) => a + b, 0) / frames;
+  const dyn = Math.sqrt(e.reduce((a, b) => a + (b - mean) ** 2, 0) / frames) / (mean + 1e-9);
+  // tempo: autocorrelation of the onset strength (rises in energy)
+  const o = new Float32Array(frames);
+  for (let f = 1; f < frames; f++) o[f] = Math.max(0, e[f] - e[f - 1]);
+  const fps = SR / F;
+  let best = 0;
+  let bestBpm = 0;
+  for (let bpm = 70; bpm <= 180; bpm++) {
+    const lag = (60 * fps) / bpm;
+    const l0 = Math.floor(lag);
+    const fr = lag - l0;
+    let c = 0;
+    for (let f = l0 + 1; f < frames; f++) c += o[f] * (o[f - l0] * (1 - fr) + o[f - l0 - 1] * fr);
+    const weight = Math.exp(-0.5 * ((bpm - 120) / 40) ** 2); // gently prefer common tempos
+    if (c * weight > best) { best = c * weight; bestBpm = bpm; }
+  }
+  return { v: ANALYSIS_VERSION, energy: +energy.toFixed(2), tempo: bestBpm, zcr: +zcr.toFixed(4), dyn: +dyn.toFixed(3) };
+}
+
+// ---------- "Made for you" mixes ----------
+// Rebuilt from your library every day; nothing is saved unless you tap Save.
+const CHILL_GENRES = ['Chill', 'R&B', 'Jazz', 'Classical', 'Acoustic'];
+const GYM_GENRES = ['Hip-Hop', 'Electronic', 'Rock', 'Metal', 'Punk'];
+
+function seeded(seedText) {
+  let h = 1779033703;
+  for (const c of seedText) h = Math.imul(h ^ c.charCodeAt(0), 3432918353), h = (h << 13) | (h >>> 19);
+  return () => {
+    h = Math.imul(h ^ (h >>> 16), 2246822507);
+    h = Math.imul(h ^ (h >>> 13), 3266489909);
+    return ((h ^= h >>> 16) >>> 0) / 4294967296;
+  };
+}
+function shuffleWith(arr, rnd) {
+  const a = arr.slice();
+  for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
+  return a;
+}
+const today = () => new Date().toISOString().slice(0, 10);
+
+let mixCache = { key: '', mixes: [] };
+function computeMixes() {
+  const all = [...state.tracks.values()];
+  const key = `${today()}|${all.length}|${all.filter((t) => t.features && !t.features.failed).length}|${all.reduce((n, t) => n + (t.plays?.length || 0), 0)}|${all.map((t) => t.genre || '').join(',').length}`;
+  if (mixCache.key === key) return mixCache.mixes;
+  const day = today();
+  const mixes = [];
+  const add = (id, name, desc, ids, hueVal, min = 5) => {
+    if (ids.length >= min) mixes.push({ id, name, desc, ids: ids.slice(0, 30), hue: hueVal });
+  };
+  const now = Date.now();
+  const MONTH = 30 * 86400e3;
+
+  // On repeat: most played in the last 30 days
+  const repeat = all
+    .map((t) => ({ t, n: (t.plays || []).filter((p) => now - p < MONTH).length }))
+    .filter((x) => x.n >= 2)
+    .sort((a, b) => b.n - a.n)
+    .map((x) => x.t.id);
+  add('repeat', 'On repeat', 'What you can’t stop playing lately', repeat, 280);
+
+  // Recently added
+  add('new', 'Recently added', 'Fresh in your library', all.filter((t) => now - t.addedAt < MONTH).sort(newestFirst).map((t) => t.id), 150, 4);
+
+  // Chill & Gym, from the song analysis (compared within your own library) + genre
+  const analyzed = all.filter((t) => t.features && !t.features.failed);
+  if (analyzed.length >= 8) {
+    const pct = (field) => {
+      const sorted = analyzed.map((t) => t.features[field]).sort((a, b) => a - b);
+      return (v) => sorted.findIndex((s) => s >= v) / Math.max(1, sorted.length - 1);
+    };
+    const eP = pct('energy');
+    const zP = pct('zcr');
+    const dP = pct('dyn');
+    const scored = analyzed.map((t) => {
+      const f = t.features;
+      const fam = genreFamily(t.genre);
+      const energy = eP(f.energy);
+      const gym = energy * 1.2 + (f.tempo >= 115 && f.tempo <= 175 ? 0.5 : f.tempo >= 100 ? 0.2 : -0.3)
+        + (1 - dP(f.dyn)) * 0.3 + (GYM_GENRES.includes(fam) ? 0.4 : CHILL_GENRES.includes(fam) ? -0.4 : 0);
+      const chill = (1 - energy) * 1.2 + (f.tempo < 105 ? 0.4 : 0) + (1 - zP(f.zcr)) * 0.3
+        + (CHILL_GENRES.includes(fam) ? 0.4 : ['Metal', 'Punk'].includes(fam) ? -0.6 : GYM_GENRES.includes(fam) ? -0.3 : 0);
+      return { id: t.id, gym, chill };
+    });
+    const pick = (field) => shuffleWith(scored.filter((s) => s[field] >= 1.1).sort((a, b) => b[field] - a[field]).slice(0, 40).map((s) => s.id), seeded(day + field));
+    add('chill', 'Chill', 'Calm, slower songs from your library', pick('chill'), 200);
+    add('gym', 'Gym', 'Fast, high-energy songs to move to', pick('gym'), 8);
+  }
+
+  // Genre mixes
+  const byGenre = new Map();
+  for (const t of all) {
+    const fam = genreFamily(t.genre);
+    if (fam) (byGenre.get(fam) || byGenre.set(fam, []).get(fam)).push(t.id);
+  }
+  for (const [fam, ids] of byGenre) {
+    add(`genre:${fam}`, `${fam} mix`, `Your ${fam.toLowerCase()} songs`, shuffleWith(ids, seeded(day + fam)), hue(fam), 4);
+  }
+
+  // Artist mixes (a few different ones each day)
+  const artistMixes = [...artistIndex().values()].filter((a) => a.ids.length >= 4);
+  for (const a of shuffleWith(artistMixes, seeded(`${day}artists`)).slice(0, 3)) {
+    add(`artist:${a.key}`, `${a.name} mix`, `Songs by ${a.name}`, shuffleWith(a.ids, seeded(day + a.key)), hue(a.key), 4);
+  }
+
+  mixCache = { key, mixes: shuffleWith(mixes, seeded(`${day}order`)) };
+  return mixCache.mixes;
+}
+
+const findMix = (id) => computeMixes().find((m) => m.id === id);
+
+function mixArt(mx, cls = '') {
+  const ids = [...new Set(mx.ids)].filter((id) => state.tracks.get(id)?.cover).slice(0, 4);
+  const cells = ids.length >= 4
+    ? `<div class="mix-covers">${ids.map((id) => { const u = coverUrlFor(id); return u ? `<div class="has-img" style="background-image:url('${u}')"></div>` : `<div data-cover="${id}"></div>`; }).join('')}</div>`
+    : '';
+  return `<div class="art mix ${cls}" style="--h:${mx.hue}">${cells}<span class="mix-label">${esc(mx.name.replace(/ mix$/, ''))}</span></div>`;
+}
+
+function renderMixes() {
+  const el = $('#mixes');
+  if (!el) return;
+  const mixes = state.libTab === 'songs' && !state.search ? computeMixes().slice(0, 10) : [];
+  el.innerHTML = mixes.length
+    ? `<h3 class="section-title">Made for you</h3><div class="recent-row">${mixes.map((mx) =>
+        `<button class="recent-item mix-item" data-action="open-mix" data-id="${esc(mx.id)}">${mixArt(mx)}<span class="s">${plural(mx.ids.length, 'song')}</span></button>`).join('')}</div>`
+    : '';
+  hydrateCovers(el);
+}
+
+function mixHTML(mx) {
+  const ts = mx.ids.map((id) => state.tracks.get(id)).filter(Boolean);
+  const total = ts.reduce((s, t) => s + (t.duration || 0), 0);
+  return `
+    <button class="back" data-action="back-library">${icon('chevron-left')} Library</button>
+    <div class="pl-head">
+      ${mixArt(mx, 'big')}
+      <div class="meta"><h2>${esc(mx.name)}</h2><div class="muted small">${esc(mx.desc)}</div><div class="muted small">${plural(ts.length, 'song')}${total ? ` · ${fmtTotal(total)}` : ''}</div></div>
+    </div>
+    <div class="actions-row">
+      <button class="pill primary" data-action="play-list">${icon('play')} Play</button>
+      <button class="pill" data-action="shuffle-list">${icon('shuffle')} Shuffle</button>
+      <button class="pill" data-action="save-mix">${icon('plus')} Save</button>
+    </div>
+    <div id="list" class="list"></div>`;
+}
+
+// Turn a mix into a normal playlist you can edit.
+async function saveMix(mx) {
+  const v = await form('Save as playlist', [{ name: 'name', label: 'Name', value: mx.name }], 'Save');
+  const name = v?.name?.trim();
+  if (!name) return;
+  const pl = { id: uid(), name, trackIds: mx.ids.slice(), createdAt: Date.now() };
+  changePlaylists((items) => items.push(pl));
+  toast(`Saved “${name}” to Playlists`);
+  state.view = { name: 'playlist', id: pl.id };
+  renderView();
+}
+
 // ---------- recently played ----------
 function addRecent(item) {
   state.recent = [{ ...item, at: Date.now() }, ...state.recent.filter((r) => !(r.type === item.type && r.id === item.id))].slice(0, 12);
@@ -793,6 +1075,7 @@ function recentEntries() {
   return state.recent.map((r) => {
     if (r.type === 'track') { const t = state.tracks.get(r.id); return t && { r, label: t.title, sub: t.artist || 'Song', html: art(t.id, t.title) }; }
     if (r.type === 'playlist') { const pl = findPlaylist(r.id); return pl && { r, label: pl.name, sub: 'Playlist', html: playlistArt(pl) }; }
+    if (r.type === 'mix') { const mx = findMix(r.id); return mx && { r, label: mx.name, sub: 'Made for you', html: mixArt(mx) }; }
     if (r.type === 'artist') { const a = artists.get(r.id); return a && { r, label: a.name, sub: 'Artist', html: artistArt(a) }; }
     return null;
   }).filter(Boolean).slice(0, 10);
@@ -813,6 +1096,7 @@ function renderRecent() {
 function currentContext() {
   if (state.view.name === 'playlist') return { type: 'playlist', id: state.view.id };
   if (state.view.name === 'artist') return { type: 'artist', id: state.view.key };
+  if (state.view.name === 'mix') return { type: 'mix', id: state.view.id };
   return null;
 }
 
@@ -937,7 +1221,13 @@ function renderList() {
     const ts = a ? a.ids.map((id) => state.tracks.get(id)).filter(Boolean) : [];
     listIds = ts.map((t) => t.id);
     el.innerHTML = ts.map((t, i) => rowHTML(t, i)).join('');
+  } else if (state.view.name === 'mix') {
+    const mix = findMix(state.view.id);
+    const ts = mix ? mix.ids.map((id) => state.tracks.get(id)).filter(Boolean) : [];
+    listIds = ts.map((t) => t.id);
+    el.innerHTML = ts.map((t, i) => rowHTML(t, i)).join('');
   } else if (state.view.name === 'library') {
+    renderMixes();
     renderRecent();
     const ts = libraryTracks();
     listIds = ts.map((t) => t.id);
@@ -1109,7 +1399,7 @@ function form(title, fields, submitLabel = 'Save') {
     openSheet(`
       <form class="sheet-form" autocomplete="off">
         <div class="sheet-head"><div class="t">${esc(title)}</div></div>
-        ${fields.map((f) => `<label class="field"><span>${esc(f.label)}</span><input name="${f.name}" value="${esc(f.value || '')}" placeholder="${esc(f.placeholder || '')}"></label>`).join('')}
+        ${fields.map((f) => `<label class="field"><span>${esc(f.label)}</span><input name="${f.name}" value="${esc(f.value || '')}" placeholder="${esc(f.placeholder || '')}"${f.options ? ` list="dl-${f.name}"` : ''}>${f.options ? `<datalist id="dl-${f.name}">${f.options.map((o) => `<option value="${esc(o)}">`).join('')}</datalist>` : ''}</label>`).join('')}
         <div class="sheet-foot"><button type="button" class="pill" data-cancel>Cancel</button><button type="submit" class="pill primary">${esc(submitLabel)}</button></div>
       </form>`, resolve);
     const f = $('#sheet form');
@@ -1266,10 +1556,12 @@ async function editTrack(t) {
   const v = await form('Edit track', [
     { name: 'title', label: 'Title', value: t.title },
     { name: 'artist', label: 'Artist', value: t.artist, placeholder: 'Optional' },
+    { name: 'genre', label: 'Genre', value: t.genre, placeholder: 'e.g. Hip-Hop, Metal, Chill', options: knownGenres() },
   ]);
   if (!v) return;
   t.title = v.title.trim() || t.title;
   t.artist = v.artist.trim();
+  t.genre = (v.genre || '').trim();
   await db.put('tracks', t);
   if (!isPendingUpload(t.id) && !state.pending.renames.includes(t.id)) state.pending.renames.push(t.id);
   await savePending();
@@ -1427,10 +1719,23 @@ function bindEvents() {
         } else if (type === 'artist') {
           state.view = { name: 'artist', key: id };
           renderView();
+        } else if (type === 'mix') {
+          state.view = { name: 'mix', id };
+          renderView();
         }
         $('#view').scrollTop = 0;
         break;
       }
+      case 'open-mix':
+        state.view = { name: 'mix', id: el.dataset.id };
+        renderView();
+        $('#view').scrollTop = 0;
+        break;
+      case 'back-library':
+        state.view = { name: 'library' };
+        renderView();
+        break;
+      case 'save-mix': { const mx = findMix(state.view.id); if (mx) saveMix(mx); break; }
       case 'queue-up': player.moveUp(Number(el.dataset.pos)); break;
       case 'queue-remove': player.removeAt(Number(el.dataset.pos)); break;
       case 'queue-clear': player.clearUpcoming(); break;
@@ -1518,6 +1823,11 @@ function bindEvents() {
   player.addEventListener('change', renderPlayer);
   player.audio.addEventListener('timeupdate', renderTime);
   player.audio.addEventListener('durationchange', renderTime);
+  let countedFor = null;
+  player.audio.addEventListener('timeupdate', () => {
+    const key = `${player.currentId}:${player.token}`;
+    if (!player.isSilent && player.audio.currentTime >= 30 && countedFor !== key) { countedFor = key; countPlay(player.currentId); }
+  });
   player.audio.addEventListener('playing', () => {
     if (player.isSilent || !player.currentId) return;
     markPlayed(player.currentId);
@@ -1590,6 +1900,7 @@ async function init() {
     if (known) player.restore(playerState);
   }
 
+  setTimeout(analyzeLibrary, 3000);
   navigator.storage?.persist?.().catch(() => {});
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
   sync();
