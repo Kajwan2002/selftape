@@ -3,7 +3,7 @@ import * as api from './api.js';
 import { player } from './player.js';
 import { icon } from './icons.js';
 
-const APP_VERSION = 'v14'; // keep in sync with VERSION in sw.js
+const APP_VERSION = 'v15'; // keep in sync with VERSION in sw.js
 
 // ---------- helpers ----------
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -843,7 +843,7 @@ async function fillGenres() {
 // ---------- listening to the songs (tempo, energy) ----------
 // Runs in the background on songs that are on this device; the result is
 // shared through the server so other devices don't need to redo it.
-const ANALYSIS_VERSION = 1;
+const ANALYSIS_VERSION = 2; // 2 = adds musical key (major/minor)
 let analyzing = false;
 async function analyzeLibrary() {
   if (analyzing) return;
@@ -920,13 +920,88 @@ async function analyzeAudio(blob) {
     const weight = Math.exp(-0.5 * ((bpm - 120) / 40) ** 2); // gently prefer common tempos
     if (c * weight > best) { best = c * weight; bestBpm = bpm; }
   }
-  return { v: ANALYSIS_VERSION, energy: +energy.toFixed(2), tempo: bestBpm, zcr: +zcr.toFixed(4), dyn: +dyn.toFixed(3) };
+  const key = detectKey(x, SR);
+  return { v: ANALYSIS_VERSION, energy: +energy.toFixed(2), tempo: bestBpm, zcr: +zcr.toFixed(4), dyn: +dyn.toFixed(3), ...key };
+}
+
+// Which notes the song uses most (a "chromagram"), compared with the classic
+// Krumhansl key profiles -> key, major/minor, and how sure it is (0..1).
+function detectKey(x, SR) {
+  const N = 4096;
+  const chroma = new Float64Array(12);
+  const re = new Float64Array(N);
+  const im = new Float64Array(N);
+  const win = new Float64Array(N).map((_, i) => 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (N - 1)));
+  const lo = Math.ceil((55 * N) / SR);
+  const hi = Math.floor((2000 * N) / SR);
+  const pc = new Int8Array(hi + 1);
+  for (let k = lo; k <= hi; k++) pc[k] = (((Math.round(12 * Math.log2((k * SR) / N / 440)) + 9) % 12) + 12) % 12;
+  for (let start = 0; start + N <= x.length; start += N) {
+    for (let i = 0; i < N; i++) { re[i] = x[start + i] * win[i]; im[i] = 0; }
+    fft(re, im);
+    for (let k = lo; k <= hi; k++) chroma[pc[k]] += Math.sqrt(re[k] * re[k] + im[k] * im[k]);
+  }
+  const MAJOR = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88];
+  const MINOR = [6.33, 2.68, 3.52, 5.38, 2.6, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17];
+  const corr = (a, b) => {
+    const ma = a.reduce((s, v) => s + v, 0) / 12;
+    const mb = b.reduce((s, v) => s + v, 0) / 12;
+    let n = 0, da = 0, db = 0;
+    for (let i = 0; i < 12; i++) { n += (a[i] - ma) * (b[i] - mb); da += (a[i] - ma) ** 2; db += (b[i] - mb) ** 2; }
+    return n / Math.sqrt(da * db || 1);
+  };
+  let best = { r: -2 };
+  let bestMaj = -2;
+  let bestMin = -2;
+  for (let tonic = 0; tonic < 12; tonic++) {
+    const rot = Array.from({ length: 12 }, (_, i) => chroma[(i + tonic) % 12]);
+    const rMaj = corr(rot, MAJOR);
+    const rMin = corr(rot, MINOR);
+    bestMaj = Math.max(bestMaj, rMaj);
+    bestMin = Math.max(bestMin, rMin);
+    if (rMaj > best.r) best = { r: rMaj, tonic, mode: 'major' };
+    if (rMin > best.r) best = { r: rMin, tonic, mode: 'minor' };
+  }
+  const NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+  return {
+    key: `${NAMES[best.tonic ?? 0]} ${best.mode || 'major'}`,
+    mode: best.mode === 'minor' ? -1 : 1,
+    modeConf: +Math.min(1, Math.abs(bestMaj - bestMin) * 4).toFixed(2), // how clearly major vs minor
+  };
+}
+
+// In-place radix-2 FFT.
+function fft(re, im) {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) { [re[i], re[j]] = [re[j], re[i]]; [im[i], im[j]] = [im[j], im[i]]; }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = (-2 * Math.PI) / len;
+    const wr = Math.cos(ang);
+    const wi = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let cr = 1, ci = 0;
+      for (let k = 0; k < len / 2; k++) {
+        const ar = re[i + k + len / 2] * cr - im[i + k + len / 2] * ci;
+        const ai = re[i + k + len / 2] * ci + im[i + k + len / 2] * cr;
+        re[i + k + len / 2] = re[i + k] - ar;
+        im[i + k + len / 2] = im[i + k] - ai;
+        re[i + k] += ar;
+        im[i + k] += ai;
+        const t = cr * wr - ci * wi;
+        ci = cr * wi + ci * wr;
+        cr = t;
+      }
+    }
+  }
 }
 
 // ---------- "Made for you" mixes ----------
 // Rebuilt from your library every day; nothing is saved unless you tap Save.
-const CHILL_GENRES = ['Chill', 'R&B', 'Jazz', 'Classical', 'Acoustic'];
-const GYM_GENRES = ['Hip-Hop', 'Electronic', 'Rock', 'Metal', 'Punk'];
 
 function seeded(seedText) {
   let h = 1779033703;
@@ -947,8 +1022,8 @@ const today = () => new Date().toISOString().slice(0, 10);
 let mixCache = { key: '', mixes: [] };
 function computeMixes() {
   const all = [...state.tracks.values()];
-  const key = `${today()}|${all.length}|${all.filter((t) => t.features && !t.features.failed).length}|${all.reduce((n, t) => n + (t.plays?.length || 0), 0)}|${all.map((t) => t.genre || '').join(',').length}`;
-  if (mixCache.key === key) return mixCache.mixes;
+  const key = `${today()}|${Math.floor(new Date().getHours() / 2)}|${all.length}|${all.filter((t) => t.features && !t.features.failed).length}|${all.reduce((n, t) => n + (t.plays?.length || 0), 0)}|${all.map((t) => t.genre || '').join(',').length}`;
+  if (mixCache.key.startsWith(key + '|')) return mixCache.mixes;
   const day = today();
   const mixes = [];
   const add = (id, name, desc, ids, hueVal, min = 5) => {
@@ -968,30 +1043,87 @@ function computeMixes() {
   // Recently added
   add('new', 'Recently added', 'Fresh in your library', all.filter((t) => now - t.addedAt < MONTH).sort(newestFirst).map((t) => t.id), 150, 4);
 
-  // Chill & Gym, from the song analysis (compared within your own library) + genre
+  // Mood mixes: built from what the app hears in each song (compared within
+  // your own library), its genre, and when you usually play it.
+  const hour = new Date().getHours();
   const analyzed = all.filter((t) => t.features && !t.features.failed);
+  const timeFirst = new Set(); // mixes that fit the current time of day go first
   if (analyzed.length >= 8) {
     const pct = (field) => {
       const sorted = analyzed.map((t) => t.features[field]).sort((a, b) => a - b);
-      return (v) => sorted.findIndex((s) => s >= v) / Math.max(1, sorted.length - 1);
+      return (v) => sorted.findIndex((x) => x >= v) / Math.max(1, sorted.length - 1);
     };
     const eP = pct('energy');
     const zP = pct('zcr');
     const dP = pct('dyn');
-    const scored = analyzed.map((t) => {
+    const tP = pct('tempo');
+    const between = (v, a, b) => (v >= a && v <= b ? 1 : 0);
+    const nightShare = (t) => {
+      const p = t.plays || [];
+      return p.length ? p.filter((x) => { const h = new Date(x).getHours(); return h >= 22 || h < 4; }).length / p.length : 0;
+    };
+    const rows = analyzed.map((t) => {
       const f = t.features;
       const fam = genreFamily(t.genre);
-      const energy = eP(f.energy);
-      const gym = energy * 1.2 + (f.tempo >= 115 && f.tempo <= 175 ? 0.5 : f.tempo >= 100 ? 0.2 : -0.3)
-        + (1 - dP(f.dyn)) * 0.3 + (GYM_GENRES.includes(fam) ? 0.4 : CHILL_GENRES.includes(fam) ? -0.4 : 0);
-      const chill = (1 - energy) * 1.2 + (f.tempo < 105 ? 0.4 : 0) + (1 - zP(f.zcr)) * 0.3
-        + (CHILL_GENRES.includes(fam) ? 0.4 : ['Metal', 'Punk'].includes(fam) ? -0.6 : GYM_GENRES.includes(fam) ? -0.3 : 0);
-      return { id: t.id, gym, chill };
+      const g = (...names) => (names.includes(fam) ? 1 : 0);
+      const mode = (f.mode ?? 0) * (f.modeConf ?? 0); // +1 clearly major ... -1 clearly minor
+      return {
+        t, f, fam, g, mode,
+        energy: eP(f.energy), bright: zP(f.zcr), steady: 1 - dP(f.dyn), tempoRank: tP(f.tempo), night: nightShare(t),
+      };
     });
-    const pick = (field) => shuffleWith(scored.filter((s) => s[field] >= 1.1).sort((a, b) => b[field] - a[field]).slice(0, 40).map((s) => s.id), seeded(day + field));
-    add('chill', 'Chill', 'Calm, slower songs from your library', pick('chill'), 200);
-    add('gym', 'Gym', 'Fast, high-energy songs to move to', pick('gym'), 8);
+    const MOODS = [
+      { id: 'gym', name: 'Gym', desc: 'Fast, high-energy songs to move to', hue: 8,
+        score: (r) => r.energy * 1.2 + (between(r.f.tempo, 115, 175) ? 0.5 : r.f.tempo >= 100 ? 0.2 : -0.3) + r.steady * 0.3
+          + r.g('Hip-Hop', 'Electronic', 'Rock', 'Metal', 'Punk') * 0.4 - r.g('Chill', 'R&B', 'Jazz', 'Classical', 'Acoustic') * 0.4 },
+      { id: 'chill', name: 'Chill', desc: 'Calm, slower songs to unwind', hue: 200,
+        score: (r) => (1 - r.energy) * 1.2 + (r.f.tempo < 105 ? 0.4 : 0) + (1 - r.bright) * 0.3
+          + r.g('Chill', 'R&B', 'Jazz', 'Classical', 'Acoustic') * 0.4 - r.g('Metal', 'Punk') * 0.6 },
+      { id: 'sad', name: 'Sad hours', desc: 'Slow, minor-key songs for when you’re in your feelings', hue: 225,
+        score: (r) => -r.mode * 0.9 + (1 - r.energy) * 0.8 + (r.f.tempo < 100 ? 0.4 : 0) + (1 - r.bright) * 0.3
+          + r.g('Acoustic', 'R&B', 'Classical') * 0.2 - r.g('Metal', 'Punk', 'Electronic') * 0.4 },
+      { id: 'happy', name: 'Feel good', desc: 'Bright, upbeat songs to lift your mood', hue: 45,
+        score: (r) => r.mode * 0.9 + (between(r.f.tempo, 100, 140) ? 0.4 : 0) + r.energy * 0.5 + r.bright * 0.2
+          + r.g('Pop', 'R&B', 'Electronic') * 0.2 - r.g('Metal') * 0.4 },
+      { id: 'drive', name: 'Late night drive', desc: 'Steady, moody songs for empty roads after dark', hue: 255, hours: [20, 4],
+        score: (r) => (between(r.f.tempo, 85, 125) ? 0.5 : 0) + (1 - Math.abs(r.energy - 0.55) * 2) * 0.5 + r.steady * 0.4
+          - r.mode * 0.3 + (1 - r.bright) * 0.6 - (r.energy > 0.85 ? 0.5 : 0) + r.night * 0.6
+          + r.g('Electronic', 'R&B', 'Hip-Hop') * 0.2 - r.g('Metal', 'Punk') * 0.4 },
+      { id: 'hype', name: 'Hype', desc: 'Your loudest, most intense songs', hue: 340,
+        score: (r) => r.energy * 1.1 + r.bright * 0.7 + r.tempoRank * 0.3 + r.steady * 0.2 + r.g('Metal', 'Punk', 'Hip-Hop', 'Electronic') * 0.3 },
+      { id: 'focus', name: 'Deep focus', desc: 'Steady, calm songs that stay out of the way', hue: 170, hours: [8, 18],
+        score: (r) => r.steady * 0.8 + (1 - Math.abs(r.energy - 0.35) * 2) * 0.5 + (1 - r.bright) * 0.4 + (between(r.f.tempo, 70, 120) ? 0.3 : 0)
+          + r.g('Classical', 'Electronic', 'Chill', 'Jazz') * 0.4 - r.g('Metal', 'Punk', 'Hip-Hop') * 0.5 },
+      { id: 'rain', name: 'Rainy day', desc: 'Soft, slow and a little grey', hue: 210,
+        score: (r) => -r.mode * 0.5 + (1 - r.energy) * 0.8 + (r.f.tempo < 95 ? 0.4 : 0) + (1 - r.bright) * 0.4
+          + r.g('Acoustic', 'Jazz', 'Classical', 'Chill') * 0.4 - r.g('Metal', 'Punk', 'Electronic') * 0.5 },
+      { id: 'morning', name: 'Morning coffee', desc: 'Light, warm songs to start the day', hue: 30, hours: [6, 11],
+        score: (r) => r.mode * 0.6 + (1 - Math.abs(r.energy - 0.4) * 2) * 0.6 + (between(r.f.tempo, 80, 118) ? 0.4 : 0)
+          + r.g('Acoustic', 'Jazz', 'Pop', 'R&B') * 0.3 - r.g('Metal', 'Punk') * 0.6 },
+    ];
+    const inHours = (h, [a, b]) => (a <= b ? h >= a && h < b : h >= a || h < b);
+    for (const m of MOODS) {
+      // the best ~30% of your library for this mood, if they really fit
+      const ranked = rows.map((r) => ({ id: r.t.id, sc: m.score(r) })).sort((a, b) => b.sc - a.sc);
+      const cut = Math.max(5, Math.ceil(rows.length * 0.3));
+      const ids = ranked.slice(0, cut).filter((x) => x.sc >= 0.9).map((x) => x.id);
+      add(m.id, m.name, m.desc, shuffleWith(ids, seeded(day + m.id)), m.hue);
+      if (m.hours && inHours(hour, m.hours)) timeFirst.add(m.id);
+    }
   }
+
+  // After dark: what *you* actually play late at night
+  const nightIds = all
+    .map((t) => ({ t, n: (t.plays || []).filter((x) => { const h = new Date(x).getHours(); return h >= 22 || h < 4; }).length }))
+    .filter((x) => x.n >= 2).sort((a, b) => b.n - a.n).map((x) => x.t.id);
+  add('afterdark', 'After dark', 'What you play when everyone’s asleep', nightIds, 265);
+  if (hour >= 21 || hour < 4) timeFirst.add('afterdark');
+
+  // Forgotten gems: in your library a while, not played for 2+ months (or never)
+  const gems = all
+    .filter((t) => now - t.addedAt > MONTH && (!t.lastPlayed || now - t.lastPlayed > 2 * MONTH))
+    .map((t) => t.id);
+  add('gems', 'Forgotten gems', 'Songs you haven’t played in a while', shuffleWith(gems, seeded(`${day}gems`)), 95);
 
   // Genre mixes
   const byGenre = new Map();
@@ -1009,7 +1141,8 @@ function computeMixes() {
     add(`artist:${a.key}`, `${a.name} mix`, `Songs by ${a.name}`, shuffleWith(a.ids, seeded(day + a.key)), hue(a.key), 4);
   }
 
-  mixCache = { key, mixes: shuffleWith(mixes, seeded(`${day}order`)) };
+  const shuffledMixes = shuffleWith(mixes, seeded(`${day}order`));
+  mixCache = { key: key + '|' + [...timeFirst].join(','), mixes: [...shuffledMixes.filter((m) => timeFirst.has(m.id)), ...shuffledMixes.filter((m) => !timeFirst.has(m.id))] };
   return mixCache.mixes;
 }
 
@@ -1026,7 +1159,7 @@ function mixArt(mx, cls = '') {
 function renderMixes() {
   const el = $('#mixes');
   if (!el) return;
-  const mixes = state.libTab === 'songs' && !state.search ? computeMixes().slice(0, 10) : [];
+  const mixes = state.libTab === 'songs' && !state.search ? computeMixes().slice(0, 14) : [];
   el.innerHTML = mixes.length
     ? `<h3 class="section-title">Made for you</h3><div class="recent-row">${mixes.map((mx) =>
         `<button class="recent-item mix-item" data-action="open-mix" data-id="${esc(mx.id)}">${mixArt(mx)}<span class="s">${plural(mx.ids.length, 'song')}</span></button>`).join('')}</div>`
