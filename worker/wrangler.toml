@@ -8,6 +8,6 @@ binding = "DB"
 database_name = "selftape"
 database_id = "7ddd6f58-3161-4f1c-9cf7-cc956d59a958"
 
-# Only your GitHub Pages site may call the API.
+# Only the Selftape app may call the API (its own address, plus the old GitHub one).
 [vars]
-ALLOWED_ORIGIN = "https://kajwan2002.github.io"
+ALLOWED_ORIGIN = "https://selftape.selftape-api.workers.dev,https://kajwan2002.github.io"

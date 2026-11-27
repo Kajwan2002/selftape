@@ -313,3 +313,12 @@ body.has-mini .view { padding-bottom: calc(var(--tabs-h) + var(--mini-h) + var(-
 .turntable.playing .tonearm .arm { transform: rotate(0deg); }
 @keyframes vinyl-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .vinyl { animation: none; } }
+
+/* shown only on the old github.io address */
+.moved {
+  position: fixed; z-index: 90; left: 12px; right: 12px; top: calc(var(--safe-t) + 12px);
+  display: flex; flex-direction: column; gap: 8px; padding: 16px; border-radius: 16px;
+  background: var(--surface-2); box-shadow: 0 12px 40px rgba(0, 0, 0, .6); font-size: 14px;
+}
+.moved span { color: var(--muted); }
+.moved a { align-self: flex-start; text-decoration: none; }

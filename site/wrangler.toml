@@ -1,0 +1,7 @@
+# The Selftape app itself (static files from ../docs), on its own address so
+# iOS treats it as its own app (separate from other web apps on github.io).
+name = "selftape"
+compatibility_date = "2025-09-01"
+
+[assets]
+directory = "../docs"

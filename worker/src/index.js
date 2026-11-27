@@ -20,7 +20,7 @@ const EXT_BY_MIME = { 'audio/mpeg': 'mp3', 'audio/mp4': 'm4a', 'audio/x-m4a': 'm
 
 export default {
   async fetch(request, env, ctx) {
-    const cors = corsHeaders(env);
+    const cors = corsHeaders(env, request);
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
     let res;
     try {
@@ -645,9 +645,13 @@ async function authorized(request, env) {
   return crypto.subtle.timingSafeEqual(a, b);
 }
 
-function corsHeaders(env) {
+// ALLOWED_ORIGIN can list several sites, comma separated.
+function corsHeaders(env, request) {
+  const allowed = String(env.ALLOWED_ORIGIN || '*').split(',').map((o) => o.trim()).filter(Boolean);
+  const origin = request.headers.get('origin') || '';
+  const allow = allowed.includes('*') ? '*' : allowed.includes(origin) ? origin : allowed[0];
   return {
-    'access-control-allow-origin': env.ALLOWED_ORIGIN || '*',
+    'access-control-allow-origin': allow,
     'access-control-allow-methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
     'access-control-allow-headers': 'authorization, content-type, x-id, x-title, x-artist, x-duration, x-added-at, x-filename',
     'access-control-max-age': '86400',

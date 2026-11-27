@@ -3,7 +3,7 @@ import * as api from './api.js';
 import { player } from './player.js';
 import { icon } from './icons.js';
 
-const APP_VERSION = 'v7'; // keep in sync with VERSION in sw.js
+const APP_VERSION = 'v8'; // keep in sync with VERSION in sw.js
 
 // ---------- helpers ----------
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -1269,6 +1269,19 @@ function bindEvents() {
   window.addEventListener('online', () => sync());
 }
 
+// The app moved to its own address so iOS doesn't mix it up with other web
+// apps on github.io (e.g. the lock screen opening the wrong app).
+const HOME_URL = 'https://selftape.selftape-api.workers.dev/';
+function showMovedNotice() {
+  if (!location.hostname.endsWith('github.io')) return;
+  const el = document.createElement('div');
+  el.className = 'moved';
+  el.innerHTML = `<b>Selftape has a new address</b>
+    <span>Open the link below in Safari, tap Share → Add to Home Screen, then delete this old icon. Your music and playlists come back after you sign in again in Settings.</span>
+    <a class="pill primary" href="${HOME_URL}">Open new Selftape</a>`;
+  document.body.appendChild(el);
+}
+
 // ---------- start ----------
 async function init() {
   $$('[data-icon]').forEach((el) => { el.innerHTML = icon(el.dataset.icon) + el.innerHTML; });
@@ -1295,6 +1308,7 @@ async function init() {
 
   bindEvents();
   render();
+  showMovedNotice();
 
   navigator.storage?.persist?.().catch(() => {});
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
