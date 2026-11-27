@@ -48,7 +48,19 @@
         <span class="muted small">Now playing</span>
         <button class="icon-btn" data-action="current-menu" data-icon="more" aria-label="Track options"></button>
       </div>
-      <div id="pArt" class="art huge"></div>
+      <div id="turntable" class="turntable">
+        <div class="vinyl"><div id="pArt" class="art label"></div><div class="spindle"></div></div>
+        <svg class="tonearm" viewBox="0 0 120 100" aria-hidden="true">
+          <g class="arm">
+            <rect x="113" y="1" width="7" height="9" rx="2" transform="rotate(42 112 10)" fill="#6b6b70"/>
+            <path d="M112 10 L87 37 L82 44" fill="none" stroke="#d9d9dc" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+            <rect x="77.5" y="42" width="8" height="5.5" rx="1.2" transform="rotate(42 81.5 44.75)" fill="#bdbdc2"/>
+          </g>
+          <circle cx="112" cy="10" r="6.5" fill="#3a3a3f"/>
+          <circle cx="112" cy="10" r="3.6" fill="#a9a9ae"/>
+          <circle cx="112" cy="10" r="1.4" fill="#2a2a2e"/>
+        </svg>
+      </div>
       <div class="p-meta"><div id="pTitle" class="p-title"></div><div id="pArtist" class="p-artist"></div></div>
       <input id="seek" class="seek" type="range" min="0" max="1000" value="0" aria-label="Seek">
       <div class="times"><span id="tCur">0:00</span><span id="tDur">0:00</span></div>

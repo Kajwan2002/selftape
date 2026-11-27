@@ -3,7 +3,7 @@ import * as api from './api.js';
 import { player } from './player.js';
 import { icon } from './icons.js';
 
-const APP_VERSION = 'v6'; // keep in sync with VERSION in sw.js
+const APP_VERSION = 'v7'; // keep in sync with VERSION in sw.js
 
 // ---------- helpers ----------
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -63,7 +63,6 @@ const saveSettings = () => db.put('kv', state.settings, 'settings');
 const savePending = () => db.put('kv', state.pending, 'pending');
 const savePlaylistsLocal = () => db.put('kv', state.playlists, 'playlists');
 const findPlaylist = (id) => state.playlists.items.find((p) => p.id === id);
-const playlistCoverId = (pl) => pl.trackIds.find((id) => state.tracks.get(id)?.cover) || pl.id;
 const playlistTracks = (pl) => pl.trackIds.map((id) => state.tracks.get(id)).filter(Boolean);
 const isPendingUpload = (id) => state.pending.uploads.includes(id);
 const isLocalOnly = (id) => !!state.tracks.get(id)?.localOnly;
@@ -141,6 +140,127 @@ function hydrateCovers(root = document) {
       el.textContent = '';
     });
   });
+}
+
+// Playlist artwork: 4+ songs with covers -> 2x2 grid, 1-3 -> the first cover, none -> letter tile.
+function playlistArt(pl, cls = '') {
+  const ids = [...new Set(pl.trackIds)].filter((id) => state.tracks.get(id)?.cover).slice(0, 4);
+  if (ids.length < 4) return art(pl.id, pl.name, cls, ids[0] || pl.id);
+  const cells = ids.map((id) => {
+    const url = coverUrlFor(id);
+    return url ? `<div class="has-img" style="background-image:url('${url}')"></div>` : `<div data-cover="${id}"></div>`;
+  });
+  return `<div class="art mosaic ${cls}">${cells.join('')}</div>`;
+}
+
+// Lock-screen artwork: a vinyl record with the cover as its label.
+// (iOS draws the lock screen itself, so it can't spin there, but it looks like a record.)
+const vinylArt = new Map(); // track id -> { key, url }
+const vinylJobs = new Map();
+function lockScreenArtwork(id) {
+  const t = state.tracks.get(id);
+  if (!t) return null;
+  const key = `${t.cover || ''}|${t.title}`;
+  const ready = vinylArt.get(id);
+  if (ready && ready.key === key) return ready.url;
+  if (!vinylJobs.has(id)) {
+    const job = makeVinylArt(t, key)
+      .then((url) => { if (url && id === player.currentId) player.updateMetadata(); })
+      .catch(() => {})
+      .finally(() => vinylJobs.delete(id));
+    vinylJobs.set(id, job);
+  }
+  return ready?.url || null;
+}
+
+async function makeVinylArt(t, key) {
+  const coverUrl = t.cover ? await loadCover(t.id) : null;
+  const S = 600;
+  const c = S / 2;
+  const R = S * 0.47;
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = S;
+  const g = cv.getContext('2d');
+  const h = hue(t.id);
+
+  const bg = g.createLinearGradient(0, 0, 0, S);
+  bg.addColorStop(0, `hsl(${h} 38% 20%)`);
+  bg.addColorStop(1, '#0d0d0f');
+  g.fillStyle = bg;
+  g.fillRect(0, 0, S, S);
+
+  // record + grooves
+  g.save();
+  g.shadowColor = 'rgba(0,0,0,.6)';
+  g.shadowBlur = 30;
+  g.shadowOffsetY = 12;
+  g.fillStyle = '#121214';
+  g.beginPath(); g.arc(c, c, R, 0, Math.PI * 2); g.fill();
+  g.restore();
+  for (let r = R * 0.4; r < R * 0.97; r += 3.2) {
+    g.strokeStyle = `rgba(255,255,255,${0.025 + (Math.sin(r * 0.37) + 1) * 0.012})`;
+    g.lineWidth = 1;
+    g.beginPath(); g.arc(c, c, r, 0, Math.PI * 2); g.stroke();
+  }
+  // light reflection
+  g.save();
+  g.beginPath(); g.arc(c, c, R, 0, Math.PI * 2); g.clip();
+  const sheen = g.createLinearGradient(0, 0, S, S);
+  sheen.addColorStop(0.3, 'rgba(255,255,255,0)');
+  sheen.addColorStop(0.45, 'rgba(255,255,255,.08)');
+  sheen.addColorStop(0.55, 'rgba(255,255,255,0)');
+  g.fillStyle = sheen;
+  g.fillRect(0, 0, S, S);
+  g.restore();
+
+  // label: the cover, or a coloured label with the first letter
+  const L = R * 0.38;
+  g.save();
+  g.beginPath(); g.arc(c, c, L, 0, Math.PI * 2); g.clip();
+  let drewCover = false;
+  if (coverUrl) {
+    try {
+      const img = new Image();
+      img.src = coverUrl;
+      await img.decode();
+      const scale = Math.max((L * 2) / img.width, (L * 2) / img.height);
+      const w = img.width * scale;
+      const hh = img.height * scale;
+      g.drawImage(img, c - w / 2, c - hh / 2, w, hh);
+      drewCover = true;
+    } catch {}
+  }
+  if (!drewCover) {
+    const lg = g.createLinearGradient(c - L, c - L, c + L, c + L);
+    lg.addColorStop(0, `hsl(${h} 72% 56%)`);
+    lg.addColorStop(1, `hsl(${h + 45} 62% 30%)`);
+    g.fillStyle = lg;
+    g.fillRect(c - L, c - L, L * 2, L * 2);
+    g.fillStyle = 'rgba(255,255,255,.92)';
+    g.font = `700 ${Math.round(L * 0.9)}px -apple-system, system-ui, sans-serif`;
+    g.textAlign = 'center';
+    g.textBaseline = 'middle';
+    g.fillText(initial(t.title), c, c + L * 0.05);
+  }
+  g.restore();
+  g.strokeStyle = 'rgba(0,0,0,.5)';
+  g.lineWidth = 3;
+  g.beginPath(); g.arc(c, c, L, 0, Math.PI * 2); g.stroke();
+
+  // spindle
+  g.fillStyle = '#d8d8dc';
+  g.beginPath(); g.arc(c, c, S * 0.016, 0, Math.PI * 2); g.fill();
+  g.strokeStyle = 'rgba(0,0,0,.45)';
+  g.lineWidth = 4;
+  g.stroke();
+
+  const blob = await new Promise((resolve) => cv.toBlob(resolve, 'image/png'));
+  if (!blob) return null;
+  const old = vinylArt.get(t.id);
+  if (old) URL.revokeObjectURL(old.url);
+  const url = URL.createObjectURL(blob);
+  vinylArt.set(t.id, { key, url });
+  return url;
 }
 
 function paintArt(el, t) {
@@ -516,7 +636,7 @@ function playlistsHTML() {
   const rows = items.map((pl) => {
     const n = playlistTracks(pl).length;
     return `<div class="row" data-action="open-playlist" data-id="${esc(pl.id)}">
-      ${art(pl.id, pl.name, '', playlistCoverId(pl))}
+      ${playlistArt(pl)}
       <div class="meta"><div class="t">${esc(pl.name)}</div><div class="s">${plural(n, 'track')}</div></div>
       <span class="chev">${icon('chevron-right')}</span>
     </div>`;
@@ -533,7 +653,7 @@ function playlistHTML(pl) {
   return `
     <button class="back" data-action="tab" data-tab="playlists">${icon('chevron-left')} Playlists</button>
     <div class="pl-head">
-      ${art(pl.id, pl.name, 'big', playlistCoverId(pl))}
+      ${playlistArt(pl, 'big')}
       <div class="meta"><h2>${esc(pl.name)}</h2><div class="muted small">${plural(ts.length, 'track')}${total ? ` · ${fmtTotal(total)}` : ''}</div></div>
     </div>
     <div class="actions-row">
@@ -682,6 +802,7 @@ function renderPlayer() {
 
   const loading = player.loadingId === id;
   const playIcon = loading ? '<span class="spinner"></span>' : icon(player.playing ? 'pause' : 'play');
+  $('#turntable').classList.toggle('playing', player.playing);
   const h = hue(t.id);
   paintArt($('#miniArt'), t);
   paintArt($('#pArt'), t);
@@ -1164,7 +1285,7 @@ async function init() {
   player.init({
     getBlob: ensureBlob,
     getTrack: (id) => state.tracks.get(id),
-    getArtwork: (id) => coverUrlFor(id),
+    getArtwork: (id) => lockScreenArtwork(id),
     onError: (err) => toast(err.message || "Couldn't play that track"),
     onDuration: (id, d) => {
       const t = state.tracks.get(id);

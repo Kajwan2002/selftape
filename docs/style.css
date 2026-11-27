@@ -268,3 +268,48 @@ body.has-mini .view { padding-bottom: calc(var(--tabs-h) + var(--mini-h) + var(-
 #syncBtn { color: var(--muted); }
 #syncBtn.error { color: var(--danger); }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* playlist mosaic: four covers in a 2x2 grid */
+.art.mosaic { display: grid; place-items: stretch; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; overflow: hidden; background: var(--surface-2); }
+.art.mosaic > div { background-size: cover; background-position: center; }
+
+/* full-screen player: a record on a turntable */
+.turntable {
+  position: relative; margin: 8px auto 0;
+  width: min(92vw, 56vh, 430px); aspect-ratio: 1.2 / 1;
+}
+.vinyl {
+  position: absolute; left: 0; top: 0; height: 100%; aspect-ratio: 1; border-radius: 50%;
+  background:
+    radial-gradient(circle, transparent 0 35%, rgba(0, 0, 0, .55) 35.5% 36.5%, transparent 37%),
+    repeating-radial-gradient(circle, #141416 0 1.5px, #1d1d20 1.5px 3px),
+    #141416;
+  box-shadow: 0 30px 60px -18px rgba(0, 0, 0, .75), inset 0 0 0 3px #0a0a0b, inset 0 0 0 5px #222226;
+  animation: vinyl-spin 3.2s linear infinite; animation-play-state: paused;
+}
+/* light reflection: stays still while the record turns underneath */
+.turntable::before {
+  content: ""; position: absolute; left: 0; top: 0; height: 100%; aspect-ratio: 1; border-radius: 50%; z-index: 1;
+  pointer-events: none;
+  background: conic-gradient(from 20deg, transparent 0 6%, rgba(255, 255, 255, .09) 11%, transparent 17%,
+    transparent 50%, rgba(255, 255, 255, .07) 61%, transparent 67%);
+}
+.turntable.playing .vinyl { animation-play-state: running; }
+.vinyl .label.art {
+  position: absolute; inset: 31%; width: auto; height: auto; border-radius: 50%;
+  font-size: clamp(28px, 8vw, 48px); box-shadow: 0 0 0 2px rgba(0, 0, 0, .5);
+}
+.spindle {
+  position: absolute; left: 50%; top: 50%; width: 3.6%; aspect-ratio: 1; transform: translate(-50%, -50%);
+  border-radius: 50%; background: radial-gradient(circle at 35% 35%, #fff, #9a9a9f 60%, #555 100%);
+  box-shadow: 0 0 0 3px rgba(0, 0, 0, .45);
+}
+.tonearm { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 2; pointer-events: none; overflow: visible; }
+.tonearm .arm {
+  transform-box: view-box; transform-origin: 112px 10px; transform: rotate(-40deg);
+  transition: transform .7s cubic-bezier(.3, .7, .3, 1);
+  filter: drop-shadow(1px 2px 1.5px rgba(0, 0, 0, .5));
+}
+.turntable.playing .tonearm .arm { transform: rotate(0deg); }
+@keyframes vinyl-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .vinyl { animation: none; } }

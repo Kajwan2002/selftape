@@ -261,7 +261,7 @@ class Player extends EventTarget {
       artist: t.artist || 'Me',
       album: 'Selftape',
       artwork: cover
-        ? [{ src: cover, sizes: '600x600', type: 'image/jpeg' }]
+        ? [{ src: cover, sizes: '600x600', type: 'image/png' }]
         : [
             { src: base + 'icon-192.png', sizes: '192x192', type: 'image/png' },
             { src: base + 'icon-512.png', sizes: '512x512', type: 'image/png' },

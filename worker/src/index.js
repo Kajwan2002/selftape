@@ -558,8 +558,10 @@ async function addFromMessage(env, msg, cfg, { source, archive }) {
     // Forwarded from the channel: it's already archived there.
     chatId = origin.chat.id;
     messageId = origin.message_id;
-  } else if (archive && cfg.channelId) {
-    // Keep a copy in the channel so all your music lives in one place.
+  } else if (archive && cfg.channelId && !origin) {
+    // Sent to the bot directly (not forwarded): keep a copy in the channel so
+    // all your music lives in one place. Forwarded songs are never copied,
+    // because you already have them somewhere (often in the channel itself).
     try {
       const copy = await tg(env, 'copyMessage', { chat_id: cfg.channelId, from_chat_id: msg.chat.id, message_id: msg.message_id, disable_notification: true });
       chatId = cfg.channelId;
