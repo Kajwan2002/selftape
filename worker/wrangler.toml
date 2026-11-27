@@ -1,0 +1,11 @@
+name = "selftape-api"
+main = "src/index.js"
+compatibility_date = "2025-09-01"
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "selftape"
+
+# Optional: only allow your GitHub Pages site to call the API.
+# [vars]
+# ALLOWED_ORIGIN = "https://YOUR-GITHUB-NAME.github.io"

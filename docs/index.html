@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0d0d0f">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Selftape">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="icon" href="icons/icon-192.png">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="stylesheet" href="style.css">
+  <title>Selftape</title>
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <div class="app">
+    <header class="top">
+      <h1 id="pageTitle">Library</h1>
+      <div class="top-btns">
+        <button id="syncBtn" class="icon-btn" data-action="sync" data-icon="sync" aria-label="Sync" hidden></button>
+        <button id="importBtn" class="icon-btn" data-action="import" data-icon="plus" aria-label="Import files"></button>
+      </div>
+    </header>
+    <main id="view" class="view"></main>
+  </div>
+
+  <div id="mini" class="mini" data-action="open-player" hidden>
+    <div id="miniArt" class="art"></div>
+    <div class="meta"><div id="miniTitle" class="t"></div><div id="miniArtist" class="s"></div></div>
+    <button id="miniPlay" class="icon-btn" data-action="toggle" aria-label="Play or pause"></button>
+    <button class="icon-btn" data-action="next" data-icon="next" aria-label="Next"></button>
+    <div class="mini-progress"><div id="miniBar"></div></div>
+  </div>
+
+  <nav class="tabs">
+    <button data-action="tab" data-tab="library" data-icon="library"><span>Library</span></button>
+    <button data-action="tab" data-tab="playlists" data-icon="playlists"><span>Playlists</span></button>
+    <button data-action="tab" data-tab="settings" data-icon="settings"><span>Settings</span></button>
+  </nav>
+
+  <section id="player" class="player" aria-hidden="true">
+    <div class="player-inner">
+      <div class="player-top">
+        <button class="icon-btn" data-action="close-player" data-icon="chevron-down" aria-label="Close player"></button>
+        <span class="muted small">Now playing</span>
+        <button class="icon-btn" data-action="current-menu" data-icon="more" aria-label="Track options"></button>
+      </div>
+      <div id="pArt" class="art huge"></div>
+      <div class="p-meta"><div id="pTitle" class="p-title"></div><div id="pArtist" class="p-artist"></div></div>
+      <input id="seek" class="seek" type="range" min="0" max="1000" value="0" aria-label="Seek">
+      <div class="times"><span id="tCur">0:00</span><span id="tDur">0:00</span></div>
+      <div class="controls">
+        <button id="pShuffle" class="icon-btn side" data-action="shuffle" data-icon="shuffle" aria-label="Shuffle"></button>
+        <button class="icon-btn" data-action="prev" data-icon="prev" aria-label="Previous"></button>
+        <button id="pPlay" class="icon-btn play-big" data-action="toggle" aria-label="Play or pause"></button>
+        <button class="icon-btn" data-action="next" data-icon="next" aria-label="Next"></button>
+        <button id="pRepeat" class="icon-btn side" data-action="repeat" aria-label="Repeat"></button>
+      </div>
+      <div class="upnext"><h3>Up next</h3><div id="upnext" class="list compact"></div></div>
+    </div>
+  </section>
+
+  <div id="overlay" class="overlay" hidden><div id="sheet" class="sheet"></div></div>
+  <div id="toast" class="toast" role="status"></div>
+  <input id="fileInput" type="file" accept="audio/*,.mp3,.m4a,.wav,.aif,.aiff,.flac,.aac,.ogg,.opus,.caf" multiple hidden>
+</body>
+</html>
