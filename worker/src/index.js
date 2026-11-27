@@ -60,6 +60,8 @@ async function route(request, env, ctx, url) {
     if (parts.length === 3 && parts[2] === 'cover' && method === 'GET') return getCover(id, env);
     if (parts.length === 3 && parts[2] === 'cover' && method === 'DELETE') return removeCover(id, env);
     if (parts.length === 4 && parts[2] === 'cover' && parts[3] === 'find' && method === 'POST') return findCoverFor(id, env);
+    if (parts.length === 4 && parts[2] === 'cover' && parts[3] === 'options' && method === 'GET') return coverOptions(id, url, env);
+    if (parts.length === 3 && parts[2] === 'cover' && method === 'PUT') return setCover(id, request, env);
     if (parts.length === 2 && method === 'PATCH') return updateTrack(id, request, env);
     if (parts.length === 2 && method === 'DELETE') {
       // Only removes it from Selftape; the Telegram message is left alone.
@@ -281,7 +283,7 @@ async function findCoverFor(id, env) {
 // Checks a batch of tracks that never had a cover lookup; the app calls this until remaining is 0.
 async function findMissingCovers(env) {
   const where = 'cover_file_id IS NULL AND cover_url IS NULL AND cover_checked IS NULL';
-  const { results } = await env.DB.prepare(`SELECT id, title, artist FROM tracks WHERE ${where} LIMIT 10`).all();
+  const { results } = await env.DB.prepare(`SELECT id, title, artist FROM tracks WHERE ${where} LIMIT 6`).all();
   let found = 0;
   for (const r of results) {
     const url = await lookupCover(r.artist, r.title).catch(() => null);
@@ -292,9 +294,54 @@ async function findMissingCovers(env) {
   return json({ checked: results.length, found, remaining: left.n });
 }
 
-// Looks the song up on Apple Music (iTunes Search) and Deezer, both free with no key.
-// Only accepts a result when the artist AND the title match, so songs that
-// aren't released anywhere don't get a random wrong cover.
+// Cover choices for the picker in the app (you choose, so no strict matching).
+async function coverOptions(id, url, env) {
+  const row = await getRow(env, id);
+  if (!row) return json({ error: 'Not found' }, 404);
+  const q = clean(url.searchParams.get('q'), 200) || [row.artist, row.title].filter(Boolean).join(' ');
+  const items = await searchCatalog(q, 30);
+  return json({ query: q, options: items.slice(0, 24) });
+}
+
+async function setCover(id, request, env) {
+  const body = await request.json().catch(() => ({}));
+  let host = '';
+  try { host = new URL(body.url).hostname; } catch {}
+  // Only accept artwork from the two catalogues the picker shows.
+  if (!/(^|\.)mzstatic\.com$|(^|\.)dzcdn\.net$/.test(host)) return json({ error: 'Unsupported image' }, 400);
+  await env.DB.prepare('UPDATE tracks SET cover_url = ?, cover_file_id = NULL, cover_checked = 1 WHERE id = ?').bind(body.url, id).run();
+  const row = await getRow(env, id);
+  return row ? json(toTrack(row)) : json({ error: 'Not found' }, 404);
+}
+
+// Searches Apple Music (iTunes Search) and Deezer, both free with no key.
+// Returns [{ title, artist, album, art }] with 600px artwork, duplicates removed.
+async function searchCatalog(query, limit = 25, { itunes = true, deezer = true } = {}) {
+  const jobs = [];
+  if (itunes) {
+    jobs.push(fetch(`https://itunes.apple.com/search?entity=song&limit=${limit}&term=${encodeURIComponent(query)}`)
+      .then((r) => (r.ok ? r.json() : { results: [] }))
+      .then((d) => (d.results || []).filter((r) => r.artworkUrl100).map((r) => ({
+        title: r.trackName, artist: r.artistName, album: r.collectionName,
+        art: r.artworkUrl100.replace(/\/\d+x\d+bb\./, '/600x600bb.'),
+      })))
+      .catch(() => []));
+  }
+  if (deezer) {
+    jobs.push(fetch(`https://api.deezer.com/search?limit=${Math.min(limit, 50)}&q=${encodeURIComponent(query)}`)
+      .then((r) => (r.ok ? r.json() : { data: [] }))
+      .then((d) => (d.data || []).filter((r) => r.album?.cover_xl).map((r) => ({
+        title: r.title, artist: r.artist?.name || '', album: r.album?.title || '', art: r.album.cover_xl,
+      })))
+      .catch(() => []));
+  }
+  const seen = new Set();
+  return (await Promise.all(jobs)).flat().filter((x) => (seen.has(x.art) ? false : seen.add(x.art)));
+}
+
+// Automatic lookup. Small differences are fine ("sweet child of mine" finds
+// "Sweet Child O' Mine", "guns and roses" finds "Guns N' Roses"), but both the
+// artist AND the title must be close, so unreleased songs don't get a random cover.
 async function lookupCover(artist, title) {
   let a = artist;
   let t = title;
@@ -302,39 +349,45 @@ async function lookupCover(artist, title) {
   const na = norm(a);
   const nt = norm(t);
   if (!na || !nt) return null;
-  const artistOk = (x) => { const n = norm(x); return !!n && (n === na || n.includes(na) || na.includes(n)); };
+
   // Versions we skip unless the title asks for them (so "Song" doesn't get the remix cover).
   const VERSION_WORDS = /\b(remix|mix|live|acoustic|instrumental|karaoke|sped up|slowed|reverb|cover|version|edit|demo)\b/;
   const wantsVersion = VERSION_WORDS.test(String(title || '').toLowerCase());
-  // 2 = exact title, 1 = close (extra words), 0 = no match
-  const score = (rawTitle, rawArtist) => {
-    if (!artistOk(rawArtist)) return 0;
-    const full = String(rawTitle || '').toLowerCase();
-    if (!wantsVersion && VERSION_WORDS.test(full.normalize('NFKD').replace(/[̀-ͯ]/g, ''))) return 0;
-    const n = norm(rawTitle);
-    if (n === nt) return 2;
-    return n.startsWith(nt + ' ') || nt.startsWith(n + ' ') ? 1 : 0;
-  };
-  const best = (items, getTitle, getArtist) =>
-    items.map((r) => [score(getTitle(r), getArtist(r)), r]).filter(([s]) => s > 0).sort((x, y) => y[0] - x[0])[0]?.[1];
 
-  try {
-    const res = await fetch(`https://itunes.apple.com/search?entity=song&limit=25&term=${encodeURIComponent(`${a} ${t}`)}`);
-    if (res.ok) {
-      const data = await res.json();
-      const hit = best(data.results || [], (r) => r.trackName, (r) => r.artistName);
-      if (hit?.artworkUrl100) return hit.artworkUrl100.replace(/\/\d+x\d+bb\./, '/600x600bb.');
-    }
-  } catch {}
-  try {
-    const res = await fetch(`https://api.deezer.com/search?limit=25&q=${encodeURIComponent(`artist:"${a}" track:"${t}"`)}`);
-    if (res.ok) {
-      const data = await res.json();
-      const hit = best(data.data || [], (r) => r.title, (r) => r.artist?.name);
-      if (hit?.album?.cover_xl) return hit.album.cover_xl;
-    }
-  } catch {}
-  return null;
+  const artistScore = (x) => {
+    const n = norm(x);
+    if (!n) return 0;
+    if (n === na || n.includes(na) || na.includes(n)) return 1;
+    return similarity(n, na);
+  };
+  const titleScore = (x) => {
+    const n = norm(x);
+    if (!n) return 0;
+    if (n === nt) return 1;
+    if (n.startsWith(nt + ' ') || nt.startsWith(n + ' ')) return 0.9;
+    return similarity(n, nt);
+  };
+  const score = (c) => {
+    if (!wantsVersion && VERSION_WORDS.test(String(c.title || '').toLowerCase())) return 0;
+    const as = artistScore(c.artist);
+    const ts = titleScore(c.title);
+    return as >= 0.75 && ts >= 0.8 ? as + ts * 2 : 0; // title counts double
+  };
+
+  // Several searches at once: the exact words, a looser Deezer search, and the
+  // artist's catalogue (catches misspelled titles) and the title alone (misspelled artist).
+  const lists = await Promise.all([
+    searchCatalog(`${a} ${t}`, 25),
+    searchCatalog(a, 200, { deezer: false }),
+    searchCatalog(t, 50, { deezer: false }),
+  ]);
+  let best = null;
+  let bestScore = 0;
+  for (const c of lists.flat()) {
+    const sc = score(c);
+    if (sc > bestScore) { best = c; bestScore = sc; }
+  }
+  return best?.art || null;
 }
 
 function norm(s) {
@@ -343,9 +396,29 @@ function norm(s) {
     .normalize('NFKD').replace(/[̀-ͯ]/g, '')
     .replace(/\(.*?\)|\[.*?\]/g, ' ') // (feat. …), [Remastered]
     .replace(/\s(feat|ft)\.?\s.*$/, ' ')
-    .replace(/&/g, ' and ')
+    .replace(/[’'`]/g, '')           // O' Mine -> O Mine
+    .replace(/&|\+/g, ' and ')
     .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .replace(/\b(n|and)\b/g, 'and')   // Guns N' Roses == Guns and Roses
+    .replace(/^the /, '')
     .trim();
+}
+
+// 0..1, how alike two strings are (1 = identical), based on edit distance.
+function similarity(a, b) {
+  if (a === b) return 1;
+  const m = a.length;
+  const n = b.length;
+  if (!m || !n) return 0;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    prev = cur;
+  }
+  return 1 - prev[n] / Math.max(m, n);
 }
 
 // ---------- telegram ----------

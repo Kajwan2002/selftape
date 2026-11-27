@@ -60,6 +60,12 @@ export const findCover = async (s, id) => (await call(s, `/tracks/${id}/cover/fi
 
 export const removeCover = async (s, id) => (await call(s, `/tracks/${id}/cover`, { method: 'DELETE' })).json();
 
+export const coverOptions = async (s, id, q) =>
+  (await call(s, `/tracks/${id}/cover/options${q ? `?q=${encodeURIComponent(q)}` : ''}`)).json();
+
+export const setCover = async (s, id, url) =>
+  (await call(s, `/tracks/${id}/cover`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url }) })).json();
+
 export const findMissingCovers = async (s) => (await call(s, '/covers/find-missing', { method: 'POST' })).json();
 
 export const connectTelegram = async (s) => (await call(s, '/telegram/setup', { method: 'POST' })).json();

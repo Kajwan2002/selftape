@@ -3,7 +3,7 @@ import * as api from './api.js';
 import { player } from './player.js';
 import { icon } from './icons.js';
 
-const APP_VERSION = 'v5'; // keep in sync with VERSION in sw.js
+const APP_VERSION = 'v6'; // keep in sync with VERSION in sw.js
 
 // ---------- helpers ----------
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -811,6 +811,42 @@ function picker(title, tracks) {
   });
 }
 
+// Search Apple Music + Deezer and let you tap the right cover.
+function coverPicker(t) {
+  return new Promise((resolve) => {
+    const q = [t.artist, t.title].filter(Boolean).join(' ');
+    openSheet(`
+      <div class="sheet-head"><div class="t">Choose a cover</div><div class="s">Search by artist and song name, then tap the right one.</div></div>
+      <form class="cover-search" autocomplete="off">
+        <input name="q" type="search" value="${esc(q)}" placeholder="Artist and song">
+        <button class="pill primary" type="submit">Search</button>
+      </form>
+      <div class="cover-grid"></div>
+      <div class="sheet-foot"><button class="pill" data-cancel>Cancel</button></div>`, resolve);
+    const sheet = $('#sheet');
+    const grid = sheet.querySelector('.cover-grid');
+    const form = sheet.querySelector('form');
+    sheet.onclick = (e) => {
+      if (e.target.closest('[data-cancel]')) return closeSheet(null);
+      const opt = e.target.closest('[data-url]');
+      if (opt) closeSheet(opt.dataset.url);
+    };
+    const run = async (query) => {
+      grid.innerHTML = '<p class="muted small">Searching…</p>';
+      try {
+        const r = await api.coverOptions(state.settings, t.id, query);
+        grid.innerHTML = r.options.length
+          ? r.options.map((o) => `<button class="cover-opt" data-url="${esc(o.art)}"><img src="${esc(o.art)}" alt="" loading="lazy"><span class="t">${esc(o.title)}</span><span class="s">${esc(o.artist)}</span></button>`).join('')
+          : '<p class="muted small">Nothing found. Try different words.</p>';
+      } catch (err) {
+        grid.innerHTML = `<p class="muted small">${esc(err.message)}</p>`;
+      }
+    };
+    form.onsubmit = (e) => { e.preventDefault(); form.q.blur(); run(form.q.value.trim()); };
+    run(q);
+  });
+}
+
 let toastTimer;
 function toast(text) {
   const el = $('#toast');
@@ -832,9 +868,8 @@ async function trackMenu(id, index) {
     { key: 'edit', label: 'Edit title & artist', icon: 'edit' },
   ];
   if (configured() && cloudCopy(id)) {
-    items.push(t.cover
-      ? { key: 'cover-remove', label: 'Remove cover', icon: 'x' }
-      : { key: 'cover-find', label: 'Find cover art', icon: 'search' });
+    items.push({ key: 'cover-pick', label: t.cover ? 'Change cover…' : 'Find cover art…', icon: 'search' });
+    if (t.cover) items.push({ key: 'cover-remove', label: 'Remove cover', icon: 'x' });
   }
   if (!state.downloaded.has(id)) items.push({ key: 'download', label: 'Download to phone', icon: 'download' });
   else if (configured() && cloudCopy(id)) items.push({ key: 'undownload', label: 'Remove download', icon: 'x' });
@@ -851,13 +886,12 @@ async function trackMenu(id, index) {
     case 'queue': player.addToQueue(id); toast('Added to queue'); break;
     case 'add': await addToPlaylist(id); break;
     case 'edit': await editTrack(t); break;
-    case 'cover-find':
-      try {
-        toast('Searching…');
-        applyServerTrack(await api.findCover(state.settings, id));
-        toast('Cover found');
-      } catch (err) { toast(err.message); }
+    case 'cover-pick': {
+      const url = await coverPicker(t);
+      if (!url) break;
+      try { applyServerTrack(await api.setCover(state.settings, id, url)); toast('Cover set'); } catch (err) { toast(err.message); }
       break;
+    }
     case 'cover-remove':
       try { applyServerTrack(await api.removeCover(state.settings, id)); } catch (err) { toast(err.message); }
       break;
