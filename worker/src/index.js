@@ -316,15 +316,17 @@ async function findMissingCovers(env) {
 // Fills in genres for songs added before genres existed (the app calls this until remaining is 0).
 async function findMissingGenres(env) {
   const where = 'genre_checked IS NULL';
+  let retry = 0;
   const { results } = await env.DB.prepare(`SELECT id, title, artist FROM tracks WHERE ${where} LIMIT 6`).all();
   let found = 0;
   for (const r of results) {
-    const m = await lookupMatch(r.artist, r.title).catch(() => null);
+    const m = await lookupMatch(r.artist, r.title).catch(() => ({ retry: true }));
     if (m?.genre) found++;
+    if (m?.retry) { retry++; continue; } // Apple said "too many requests": try this one again later
     await env.DB.prepare('UPDATE tracks SET genre = COALESCE(genre, ?), genre_checked = 1 WHERE id = ?').bind(m?.genre || null, r.id).run();
   }
   const left = await env.DB.prepare(`SELECT COUNT(*) AS n FROM tracks WHERE ${where}`).first();
-  return json({ checked: results.length, found, remaining: left.n });
+  return json({ checked: results.length, found, retry, remaining: left.n });
 }
 
 // Cover choices for the picker in the app (you choose, so no strict matching).
@@ -429,23 +431,24 @@ async function artistPhotoOptions(url) {
 
 // Searches Apple Music (iTunes Search) and Deezer, both free with no key.
 // Returns [{ title, artist, album, art }] with 600px artwork, duplicates removed.
-async function searchCatalog(query, limit = 25, { itunes = true, deezer = true } = {}) {
+async function searchCatalog(query, limit = 25, { itunes = true, deezer = true, status = {} } = {}) {
   const jobs = [];
   if (itunes) {
     jobs.push(fetch(`https://itunes.apple.com/search?entity=song&limit=${limit}&term=${encodeURIComponent(query)}`)
-      .then((r) => (r.ok ? r.json() : { results: [] }))
+      .then((r) => { if (!r.ok) status.itunesFailed = true; return r.ok ? r.json() : { results: [] }; })
       .then((d) => (d.results || []).filter((r) => r.artworkUrl100).map((r) => ({
         title: r.trackName, artist: r.artistName, album: r.collectionName,
         art: r.artworkUrl100.replace(/\/\d+x\d+bb\./, '/600x600bb.'),
         genre: r.primaryGenreName || '',
       })))
-      .catch(() => []));
+      .catch(() => { status.itunesFailed = true; return []; }));
   }
   if (deezer) {
     jobs.push(fetch(`https://api.deezer.com/search?limit=${Math.min(limit, 50)}&q=${encodeURIComponent(query)}`)
       .then((r) => (r.ok ? r.json() : { data: [] }))
       .then((d) => (d.data || []).filter((r) => r.album?.cover_xl).map((r) => ({
         title: r.title, artist: r.artist?.name || '', album: r.album?.title || '', art: r.album.cover_xl,
+        deezerAlbum: r.album?.id,
       })))
       .catch(() => []));
   }
@@ -457,7 +460,7 @@ async function searchCatalog(query, limit = 25, { itunes = true, deezer = true }
 // "Sweet Child O' Mine", "guns and roses" finds "Guns N' Roses"), but both the
 // artist AND the title must be close, so unreleased songs don't get a random cover.
 async function lookupCover(artist, title) {
-  return (await lookupMatch(artist, title))?.art || null;
+  return (await lookupMatch(artist, title))?.art || null; // null when nothing matched
 }
 
 async function lookupMatch(artist, title) {
@@ -492,23 +495,39 @@ async function lookupMatch(artist, title) {
     return as >= 0.75 && ts >= 0.8 ? as + ts * 2 : 0; // title counts double
   };
 
-  // Several searches at once: the exact words, a looser Deezer search, and the
-  // artist's catalogue (catches misspelled titles) and the title alone (misspelled artist).
-  const lists = await Promise.all([
-    searchCatalog(`${a} ${t}`, 25),
-    searchCatalog(a, 200, { deezer: false }),
-    searchCatalog(t, 50, { deezer: false }),
-  ]);
-  let best = null;
-  let bestScore = 0;
-  for (const c of lists.flat()) {
-    const sc = score(c);
-    if (sc > bestScore) { best = c; bestScore = sc; }
+  // First the exact words on both catalogues. Only if that finds nothing, also
+  // search the artist's catalogue (misspelled titles) and the title alone
+  // (misspelled artist). Fewer requests = less chance Apple says "too many".
+  const status = {};
+  const candidates = await searchCatalog(`${a} ${t}`, 25, { status });
+  const pickBest = (list) => {
+    let best = null;
+    let bestScore = 0;
+    for (const c of list) { const sc = score(c); if (sc > bestScore) { best = c; bestScore = sc; } }
+    return best;
+  };
+  let best = pickBest(candidates);
+  if (!best) {
+    const more = await Promise.all([
+      searchCatalog(a, 200, { deezer: false, status }),
+      searchCatalog(t, 50, { deezer: false, status }),
+    ]);
+    candidates.push(...more.flat());
+    best = pickBest(candidates);
   }
-  if (!best) return null;
-  // Deezer results have no genre; borrow it from an Apple Music result for the same song.
-  const genre = best.genre || lists.flat().find((c) => c.genre && score(c) > 0)?.genre || '';
-  return { art: best.art, genre };
+  if (!best) return status.itunesFailed ? { art: null, genre: '', retry: true } : null;
+  // Genre: from an Apple Music result for the same song, else from the Deezer album.
+  let genre = best.genre || candidates.find((c) => c.genre && score(c) > 0)?.genre || '';
+  if (!genre) {
+    const albumId = best.deezerAlbum || candidates.find((c) => c.deezerAlbum && score(c) > 0)?.deezerAlbum;
+    if (albumId) {
+      genre = await fetch(`https://api.deezer.com/album/${albumId}`)
+        .then((r) => (r.ok ? r.json() : {}))
+        .then((d) => d.genres?.data?.[0]?.name || '')
+        .catch(() => '');
+    }
+  }
+  return { art: best.art, genre, retry: !genre && status.itunesFailed };
 }
 
 function norm(s) {

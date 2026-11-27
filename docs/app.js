@@ -3,7 +3,7 @@ import * as api from './api.js';
 import { player } from './player.js';
 import { icon } from './icons.js';
 
-const APP_VERSION = 'v12'; // keep in sync with VERSION in sw.js
+const APP_VERSION = 'v13'; // keep in sync with VERSION in sw.js
 
 // ---------- helpers ----------
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -834,7 +834,7 @@ async function fillGenres() {
     for (let i = 0; i < 100; i++) {
       const r = await api.findMissingGenres(state.settings);
       found += r.found;
-      if (!r.remaining || !r.checked) break;
+      if (!r.remaining || !r.checked || r.retry >= r.checked) break; // nothing more to do right now
     }
     if (found) scheduleSync(500);
   } catch {}
