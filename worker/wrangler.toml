@@ -6,6 +6,6 @@ compatibility_date = "2025-09-01"
 binding = "BUCKET"
 bucket_name = "selftape"
 
-# Optional: only allow your GitHub Pages site to call the API.
-# [vars]
-# ALLOWED_ORIGIN = "https://YOUR-GITHUB-NAME.github.io"
+# Only your GitHub Pages site may call the API.
+[vars]
+ALLOWED_ORIGIN = "https://kajwan2002.github.io"
