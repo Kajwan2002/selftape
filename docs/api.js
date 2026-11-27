@@ -54,8 +54,8 @@ export const saveFeatures = (s, id, features) => call(s, `/tracks/${id}`, { meth
 
 export const lookupTrack = async (s, id) => (await call(s, `/tracks/${id}/lookup`, { method: 'POST' })).json();
 
-export const fixLibrary = async (s, after, rename = true) =>
-  (await call(s, '/library/fix', { method: 'POST', ...jsonBody({ after, rename }) })).json();
+export const fixLibrary = async (s, after, { rename = true, onlyMissing = false } = {}) =>
+  (await call(s, '/library/fix', { method: 'POST', ...jsonBody({ after, rename, onlyMissing }) })).json();
 
 export const restoreName = async (s, id) => (await call(s, `/tracks/${id}`, { method: 'PATCH', ...jsonBody({ restore: true }) })).json();
 

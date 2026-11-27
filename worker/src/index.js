@@ -408,7 +408,9 @@ async function fixLibrary(request, env) {
   const body = await request.json().catch(() => ({}));
   const after = String(body.after || '');
   const rename = body.rename !== false;
-  const { results } = await env.DB.prepare('SELECT * FROM tracks WHERE id > ? ORDER BY id LIMIT 5').bind(after).all();
+  // onlyMissing: just the songs without a genre or a cover (the "problem" ones)
+  const filter = body.onlyMissing ? "AND (genre IS NULL OR genre = '' OR (cover_file_id IS NULL AND (cover_url IS NULL OR cover_url = '')))" : '';
+  const { results } = await env.DB.prepare(`SELECT * FROM tracks WHERE id > ? ${filter} ORDER BY id LIMIT 5`).bind(after).all();
   const report = { renamed: [], genres: 0, covers: 0, retry: 0 };
   for (const row of results) {
     const needs = !row.genre || (!row.cover_file_id && !row.cover_url) || (rename && !row.fix_checked && !row.name_locked);

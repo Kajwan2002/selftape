@@ -3,7 +3,7 @@ import * as api from './api.js';
 import { player } from './player.js';
 import { icon } from './icons.js';
 
-const APP_VERSION = 'v18'; // keep in sync with VERSION in sw.js
+const APP_VERSION = 'v19'; // keep in sync with VERSION in sw.js
 
 // ---------- helpers ----------
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -1269,24 +1269,25 @@ function songInfoCard() {
       </div>
       <p class="muted small">Looks every song up again: fills in missing genres and covers, and fixes messy titles and artists (swapped, typos, “official video”…). Names you edited yourself are never changed.</p>
       <div class="row-btns">
-        <button class="pill primary" data-action="fix-all">${icon('sync')} Check & fix all songs</button>
-        ${noGenre || noCover ? `<button class="pill" data-action="missing-info">See songs missing info</button>` : ''}
+        ${noGenre || noCover ? `<button class="pill primary" data-action="fix-missing">${icon('search')} Fix songs missing info</button>` : ''}
+        <button class="pill${noGenre || noCover ? '' : ' primary'}" data-action="fix-all">${icon('sync')} Check & fix all songs</button>
+        ${noGenre || noCover ? `<button class="pill ghost" data-action="missing-info">See which songs</button>` : ''}
       </div>
     </section>`;
 }
 
 let fixingAll = false;
-async function fixAllSongs() {
+async function fixAllSongs({ onlyMissing = false } = {}) {
   if (fixingAll || !configured()) return;
   fixingAll = true;
-  const total = state.tracks.size;
+  const total = onlyMissing ? [...state.tracks.values()].filter((t) => missingGenre(t) || missingCover(t)).length : state.tracks.size;
   const report = { renamed: [], genres: 0, covers: 0, retry: 0 };
   try {
     let after = '';
     let checked = 0;
     for (let i = 0; i < 400; i++) {
       toast(`Checking songs… ${Math.min(checked, total)} / ${total}`);
-      const r = await api.fixLibrary(state.settings, after, true);
+      const r = await api.fixLibrary(state.settings, after, { onlyMissing });
       report.renamed.push(...r.renamed);
       report.genres += r.genres;
       report.covers += r.covers;
@@ -2067,6 +2068,7 @@ function bindEvents() {
       case 'remove-downloads': removeDownloads(); break;
       case 'find-covers': findMissingCovers(); break;
       case 'fix-all': fixAllSongs(); break;
+      case 'fix-missing': fixAllSongs({ onlyMissing: true }); break;
       case 'missing-info': showMissingInfo(); break;
       case 'open-player': openPlayer(); break;
       case 'close-player': closePlayer(); break;
