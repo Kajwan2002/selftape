@@ -335,7 +335,7 @@ body.has-mini .view { padding-bottom: calc(var(--tabs-h) + var(--mini-h) + var(-
 .section-title { margin: 2px 0 10px; font-size: 17px; }
 .recent-row {
   display: flex; gap: 12px; overflow-x: auto; margin: 0 -16px 14px; padding: 0 16px 4px;
-  scroll-snap-type: x proximity; scrollbar-width: none;
+  scroll-snap-type: x proximity; scroll-padding-inline: 16px; scrollbar-width: none;
 }
 .recent-row::-webkit-scrollbar { display: none; }
 .recent-item { flex: none; width: 104px; display: flex; flex-direction: column; gap: 3px; text-align: left; scroll-snap-align: start; }
@@ -372,3 +372,10 @@ body.has-mini .view { padding-bottom: calc(var(--tabs-h) + var(--mini-h) + var(-
   letter-spacing: -.02em; line-height: 1.05; color: #fff; text-align: left;
 }
 .art.mix.big .mix-label { font-size: 17px; padding: 0 8px 7px; }
+
+/* mouse: grab-to-scroll rows */
+@media (pointer: fine) {
+  .recent-row { cursor: grab; }
+  .recent-row.dragging { cursor: grabbing; scroll-snap-type: none; }
+  .recent-row.dragging * { pointer-events: none; }
+}

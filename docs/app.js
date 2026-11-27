@@ -3,7 +3,7 @@ import * as api from './api.js';
 import { player } from './player.js';
 import { icon } from './icons.js';
 
-const APP_VERSION = 'v16'; // keep in sync with VERSION in sw.js
+const APP_VERSION = 'v17'; // keep in sync with VERSION in sw.js
 
 // ---------- helpers ----------
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -1988,6 +1988,36 @@ function bindEvents() {
   });
 
   $('#overlay').addEventListener('click', (e) => { if (e.target.id === 'overlay') closeSheet(null); });
+
+  // Mouse: grab and drag the "Made for you" / "Recently played" rows sideways.
+  // (Touch screens and trackpads already scroll them natively.)
+  let drag = null;
+  let suppressClick = false;
+  document.addEventListener('pointerdown', (e) => {
+    const row = e.target.closest('.recent-row');
+    if (!row || e.pointerType !== 'mouse' || e.button !== 0) return;
+    drag = { row, x: e.clientX, left: row.scrollLeft, moved: false, id: e.pointerId };
+  });
+  document.addEventListener('pointermove', (e) => {
+    if (!drag || e.pointerId !== drag.id) return;
+    const dx = e.clientX - drag.x;
+    if (!drag.moved && Math.abs(dx) > 5) {
+      drag.moved = true;
+      drag.row.classList.add('dragging');
+      drag.row.setPointerCapture?.(e.pointerId);
+    }
+    if (drag.moved) { drag.row.scrollLeft = drag.left - dx; e.preventDefault(); }
+  });
+  const endDrag = () => {
+    if (!drag) return;
+    if (drag.moved) { suppressClick = true; setTimeout(() => { suppressClick = false; }, 0); }
+    drag.row.classList.remove('dragging');
+    drag = null;
+  };
+  document.addEventListener('pointerup', endDrag);
+  document.addEventListener('pointercancel', endDrag);
+  // a drag shouldn't also open the mix you let go on
+  document.addEventListener('click', (e) => { if (suppressClick) { e.stopPropagation(); e.preventDefault(); suppressClick = false; } }, true);
 
   document.addEventListener('input', (e) => {
     if (e.target.id === 'search') { state.search = e.target.value; renderList(); }
