@@ -3,7 +3,8 @@
 A minimal music player for your own music. It runs as a web app on your iPhone (no App Store, no Apple developer account). Your audio files live in your own Telegram channel, which is free with no storage limit, and a small free Cloudflare server keeps your library and playlists in sync.
 
 ```
-docs/     the app (GitHub Pages): https://kajwan2002.github.io/selftape/
+docs/     the app: https://selftape.selftape-api.workers.dev/
+site/     deploys docs/ to its own address (cd site; npx --prefix ../worker wrangler deploy)
 worker/   the server (Cloudflare Worker + D1 database) and the Telegram bot
 ```
 
@@ -30,7 +31,7 @@ worker/   the server (Cloudflare Worker + D1 database) and the Telegram bot
    npx wrangler secret put APP_TOKEN
    ```
    `APP_TOKEN` is a password you make up. The app uses it to talk to the server.
-3. **App:** push this repo and turn on GitHub Pages: Settings → Pages → branch `main`, folder `/docs`.
+3. **App:** in `site/`, run `npx --prefix ../worker wrangler deploy`. The app needs its own address: iPhone treats all web apps on one address (like username.github.io) as the same app.
 4. **iPhone:** open the Pages link in Safari, tap Share → Add to Home Screen. In Settings, enter the server URL and app password, then tap **Connect bot** and press Start in Telegram.
 5. **Channel:** add the bot as an admin of your music channel. The bot confirms in Telegram. To add old tracks, forward them to the bot.
 
