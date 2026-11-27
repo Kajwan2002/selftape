@@ -3,7 +3,7 @@ import * as api from './api.js';
 import { player } from './player.js';
 import { icon } from './icons.js';
 
-const APP_VERSION = 'v10'; // keep in sync with VERSION in sw.js
+const APP_VERSION = 'v11'; // keep in sync with VERSION in sw.js
 
 // ---------- helpers ----------
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -53,6 +53,7 @@ const state = {
   search: '',
   libTab: 'songs', // songs | artists
   recent: [],      // [{ type: 'track'|'playlist'|'artist', id, at }]
+  artistPhotos: {}, // artist key -> photo url ('' = checked, no photo)
   syncing: false,
   syncError: '',
   telegram: null,
@@ -132,6 +133,17 @@ function loadCover(id) {
 }
 
 function hydrateCovers(root = document) {
+  $$('[data-artist]', root).forEach((el) => {
+    const key = el.dataset.artist;
+    const name = el.dataset.name;
+    el.removeAttribute('data-artist');
+    loadArtistPhoto(key, name).then((url) => {
+      if (!url || !el.isConnected) return;
+      el.classList.add('has-img');
+      el.style.backgroundImage = `url('${url}')`;
+      el.textContent = '';
+    });
+  });
   $$('[data-cover]', root).forEach((el) => {
     const id = el.dataset.cover;
     el.removeAttribute('data-cover');
@@ -558,6 +570,11 @@ async function sync(manual = false) {
     }
     state.lastSync = Date.now();
     state.telegram = lib.telegram || null;
+    if (lib.artistPhotos && JSON.stringify(lib.artistPhotos) !== JSON.stringify(state.artistPhotos)) {
+      state.artistPhotos = lib.artistPhotos;
+      db.put('kv', state.artistPhotos, 'artistPhotos');
+      if (state.view.name === 'artist' || state.libTab === 'artists') changed = true;
+    }
     if (uploadProblem) state.syncError = uploadProblem;
     if (changed) renderView();
     if (s.autoDownload) backgroundDownload();
@@ -665,18 +682,101 @@ function artistIndex() {
 
 const artistCoverId = (a) => a.ids.find((id) => state.tracks.get(id)?.cover) || a.ids[0];
 
+// Artist picture: their photo (from Deezer) when there is one, else a song cover.
+const artistUrls = new Map(); // key -> { ver, url }
+const artistJobs = new Map();
+function artistArt(a, cls = '') {
+  const ver = state.artistPhotos[a.key];
+  if (!ver) return art(a.key, a.name, `round ${cls}`, artistCoverId(a));
+  const ready = artistUrls.get(a.key);
+  if (ready && ready.ver === ver) return `<div class="art round has-img ${cls}" style="--h:${hue(a.key)};background-image:url('${ready.url}')"></div>`;
+  return `<div class="art round ${cls}" style="--h:${hue(a.key)}" data-artist="${esc(a.key)}" data-name="${esc(a.name)}">${esc(initial(a.name))}</div>`;
+}
+
+function loadArtistPhoto(key, name) {
+  const ver = state.artistPhotos[key];
+  if (!ver) return Promise.resolve(null);
+  const ready = artistUrls.get(key);
+  if (ready && ready.ver === ver) return Promise.resolve(ready.url);
+  if (artistJobs.has(key)) return artistJobs.get(key);
+  const job = (async () => {
+    let rec = await db.get('kv', `aphoto:${key}`);
+    if (!rec || rec.ver !== ver) {
+      if (!configured() || !navigator.onLine) return null;
+      const blob = await limited(() => api.getArtistPhoto(state.settings, name)).catch(() => null);
+      if (!blob) return null;
+      rec = { ver, blob };
+      await db.put('kv', rec, `aphoto:${key}`);
+    }
+    const old = artistUrls.get(key);
+    if (old) URL.revokeObjectURL(old.url);
+    const url = URL.createObjectURL(rec.blob);
+    artistUrls.set(key, { ver, url });
+    return url;
+  })().finally(() => artistJobs.delete(key));
+  artistJobs.set(key, job);
+  return job;
+}
+
+// Ask the server about artists it hasn't checked yet (a few at a time).
+let artistLookupBusy = false;
+async function checkArtistPhotos(artists) {
+  if (artistLookupBusy || !configured() || !navigator.onLine) return;
+  const todo = artists.filter((a) => !(a.key in state.artistPhotos));
+  if (!todo.length) return;
+  artistLookupBusy = true;
+  try {
+    for (let i = 0; i < todo.length; i += 8) {
+      const batch = todo.slice(i, i + 8).map((a) => ({
+        name: a.name,
+        titles: a.ids.map((id) => state.tracks.get(id)?.title).filter(Boolean).slice(0, 8),
+      }));
+      const r = await api.findArtistPhotos(state.settings, batch);
+      Object.assign(state.artistPhotos, r.photos);
+      // mark ones the server skipped so we don't ask again this session
+      for (const b of batch) { const k = artistKey(b.name); if (!(k in state.artistPhotos)) state.artistPhotos[k] = ''; }
+      db.put('kv', state.artistPhotos, 'artistPhotos');
+      if (Object.values(r.photos).some(Boolean) && (state.view.name === 'library' || state.view.name === 'artist')) renderList();
+    }
+  } catch {} finally {
+    artistLookupBusy = false;
+  }
+}
+
+async function artistMenu(a) {
+  const has = !!state.artistPhotos[a.key];
+  const key = await menu(a.name, [
+    { key: 'pick', label: has ? 'Change photo…' : 'Choose photo…', icon: 'search' },
+    ...(has ? [{ key: 'none', label: 'Use a song cover instead', icon: 'x' }] : []),
+  ]);
+  if (!key) return;
+  const url = key === 'pick'
+    ? await imagePicker({ title: 'Choose a photo', hint: 'Search for the artist, then tap the right photo.', query: a.name, round: true,
+        search: (q) => api.artistPhotoOptions(state.settings, q) })
+    : '';
+  if (key === 'pick' && !url) return;
+  try {
+    await api.setArtistPhoto(state.settings, a.name, url);
+    state.artistPhotos[a.key] = url;
+    db.put('kv', state.artistPhotos, 'artistPhotos');
+    renderView();
+  } catch (err) { toast(err.message); }
+}
+
 function artistHTML(a) {
   const ts = a.ids.map((id) => state.tracks.get(id)).filter(Boolean);
   const total = ts.reduce((s, t) => s + (t.duration || 0), 0);
   return `
     <button class="back" data-action="back-artists">${icon('chevron-left')} Artists</button>
     <div class="pl-head">
-      ${art(a.key, a.name, 'big round', artistCoverId(a))}
+      ${artistArt(a, 'big')}
       <div class="meta"><h2>${esc(a.name)}</h2><div class="muted small">${plural(ts.length, 'track')}${total ? ` · ${fmtTotal(total)}` : ''}</div></div>
     </div>
     <div class="actions-row">
       <button class="pill primary" data-action="play-list">${icon('play')} Play</button>
       <button class="pill" data-action="shuffle-list">${icon('shuffle')} Shuffle</button>
+      <span class="grow"></span>
+      ${configured() ? `<button class="icon-btn more" data-action="artist-menu" aria-label="Artist options">${icon('more')}</button>` : ''}
     </div>
     <div id="list" class="list"></div>`;
 }
@@ -693,7 +793,7 @@ function recentEntries() {
   return state.recent.map((r) => {
     if (r.type === 'track') { const t = state.tracks.get(r.id); return t && { r, label: t.title, sub: t.artist || 'Song', html: art(t.id, t.title) }; }
     if (r.type === 'playlist') { const pl = findPlaylist(r.id); return pl && { r, label: pl.name, sub: 'Playlist', html: playlistArt(pl) }; }
-    if (r.type === 'artist') { const a = artists.get(r.id); return a && { r, label: a.name, sub: 'Artist', html: art(a.key, a.name, 'round', artistCoverId(a)) }; }
+    if (r.type === 'artist') { const a = artists.get(r.id); return a && { r, label: a.name, sub: 'Artist', html: artistArt(a) }; }
     return null;
   }).filter(Boolean).slice(0, 10);
 }
@@ -825,13 +925,15 @@ function renderList() {
     listIds = [];
     el.innerHTML = list.length
       ? list.map((a) => `<div class="row" data-action="open-artist" data-key="${esc(a.key)}">
-          ${art(a.key, a.name, 'round', artistCoverId(a))}
+          ${artistArt(a)}
           <div class="meta"><div class="t">${esc(a.name)}</div><div class="s">${plural(a.ids.length, 'track')}</div></div>
           <span class="chev">${icon('chevron-right')}</span>
         </div>`).join('')
       : emptyHTML(q ? 'Nothing found' : 'No artists yet', q ? 'Try a different search.' : 'Add the artist to your songs with ••• → Edit title & artist.');
+    checkArtistPhotos(list);
   } else if (state.view.name === 'artist') {
     const a = artistIndex().get(state.view.key);
+    if (a) checkArtistPhotos([a]);
     const ts = a ? a.ids.map((id) => state.tracks.get(id)).filter(Boolean) : [];
     listIds = ts.map((t) => t.id);
     el.innerHTML = ts.map((t, i) => rowHTML(t, i)).join('');
@@ -1042,15 +1144,25 @@ function picker(title, tracks) {
 
 // Search Apple Music + Deezer and let you tap the right cover.
 function coverPicker(t) {
+  return imagePicker({
+    title: 'Choose a cover',
+    hint: 'Search by artist and song name, then tap the right one.',
+    query: [t.artist, t.title].filter(Boolean).join(' '),
+    search: (q) => api.coverOptions(state.settings, t.id, q),
+  });
+}
+
+// A sheet with a search box and a grid of images to tap.
+function imagePicker({ title, hint, query, search, round = false }) {
   return new Promise((resolve) => {
-    const q = [t.artist, t.title].filter(Boolean).join(' ');
+    const q = query;
     openSheet(`
-      <div class="sheet-head"><div class="t">Choose a cover</div><div class="s">Search by artist and song name, then tap the right one.</div></div>
+      <div class="sheet-head"><div class="t">${esc(title)}</div><div class="s">${esc(hint)}</div></div>
       <form class="cover-search" autocomplete="off">
-        <input name="q" type="search" value="${esc(q)}" placeholder="Artist and song">
+        <input name="q" type="search" value="${esc(q)}" placeholder="Search">
         <button class="pill primary" type="submit">Search</button>
       </form>
-      <div class="cover-grid"></div>
+      <div class="cover-grid${round ? ' round' : ''}"></div>
       <div class="sheet-foot"><button class="pill" data-cancel>Cancel</button></div>`, resolve);
     const sheet = $('#sheet');
     const grid = sheet.querySelector('.cover-grid');
@@ -1063,7 +1175,7 @@ function coverPicker(t) {
     const run = async (query) => {
       grid.innerHTML = '<p class="muted small">Searching…</p>';
       try {
-        const r = await api.coverOptions(state.settings, t.id, query);
+        const r = await search(query);
         grid.innerHTML = r.options.length
           ? r.options.map((o) => `<button class="cover-opt" data-url="${esc(o.art)}"><img src="${esc(o.art)}" alt="" loading="lazy"><span class="t">${esc(o.title)}</span><span class="s">${esc(o.artist)}</span></button>`).join('')
           : '<p class="muted small">Nothing found. Try different words.</p>';
@@ -1322,6 +1434,7 @@ function bindEvents() {
       case 'queue-up': player.moveUp(Number(el.dataset.pos)); break;
       case 'queue-remove': player.removeAt(Number(el.dataset.pos)); break;
       case 'queue-clear': player.clearUpcoming(); break;
+      case 'artist-menu': { const a = artistIndex().get(state.view.key); if (a) artistMenu(a); break; }
       case 'track-menu': trackMenu(el.dataset.id, el.dataset.index); break;
       case 'open-playlist':
         state.view = { name: 'playlist', id: el.dataset.id };
@@ -1449,6 +1562,7 @@ async function init() {
     db.get('kv', 'recent'), db.get('kv', 'playerState'),
   ]);
   if (Array.isArray(recent)) state.recent = recent;
+  state.artistPhotos = (await db.get('kv', 'artistPhotos')) || {};
   tracks.forEach((t) => state.tracks.set(t.id, t));
   state.downloaded = new Set(blobKeys);
   if (playlists) state.playlists = playlists;

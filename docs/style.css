@@ -347,3 +347,6 @@ body.has-mini .view { padding-bottom: calc(var(--tabs-h) + var(--mini-h) + var(-
 /* up next */
 .upnext-head { display: flex; align-items: center; justify-content: space-between; }
 .upnext-head .pill { height: 30px; font-size: 14px; }
+
+.cover-grid.round .cover-opt img { border-radius: 50%; }
+.cover-grid.round .cover-opt { text-align: center; }

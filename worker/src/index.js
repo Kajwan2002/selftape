@@ -50,6 +50,10 @@ async function route(request, env, ctx, url) {
   if (pathname === '/playlists' && method === 'PUT') return putPlaylists(request, env);
   if (pathname === '/telegram/setup' && method === 'POST') return setupTelegram(env, url);
   if (pathname === '/covers/find-missing' && method === 'POST') return findMissingCovers(env);
+  if (pathname === '/artist-photos/find' && method === 'POST') return findArtistPhotos(request, env);
+  if (pathname === '/artist-photo' && method === 'GET') return getArtistPhoto(url, env);
+  if (pathname === '/artist-photo' && method === 'PUT') return setArtistPhoto(request, env);
+  if (pathname === '/artist-photo/options' && method === 'GET') return artistPhotoOptions(url);
 
   const parts = pathname.split('/').filter(Boolean);
   if (parts[0] === 'tracks') {
@@ -147,6 +151,7 @@ async function getLibrary(env) {
     tracks: results.map(toTrack),
     playlists,
     telegram: { connected: !!(cfg.ownerIds || []).length, channel: cfg.channelTitle || null },
+    artistPhotos: await getKV(env, 'artistPhotos', {}), // artist key -> photo url ('' = checked, none)
   });
 }
 
@@ -312,6 +317,86 @@ async function setCover(id, request, env) {
   await env.DB.prepare('UPDATE tracks SET cover_url = ?, cover_file_id = NULL, cover_checked = 1 WHERE id = ?').bind(body.url, id).run();
   const row = await getRow(env, id);
   return row ? json(toTrack(row)) : json({ error: 'Not found' }, 404);
+}
+
+// ---------- artist photos (from Deezer) ----------
+
+const artistKeyOf = (name) => String(name || '').toLowerCase().replace(/\s+/g, ' ').trim();
+const realPhoto = (u) => u && !/\/artist\/\/|\/images\/artist\/\//.test(u) ? u : ''; // Deezer's "no photo" placeholder
+
+// The app sends artists it has no answer for yet, with a few of your song titles.
+// A photo is only used when Deezer has an artist with that name AND one of your
+// songs by them, so your own name doesn't get a stranger's photo.
+async function findArtistPhotos(request, env) {
+  const body = await request.json().catch(() => ({}));
+  const list = (Array.isArray(body.artists) ? body.artists : []).slice(0, 8);
+  const photos = await getKV(env, 'artistPhotos', {});
+  const results = {};
+  await Promise.all(list.map(async ({ name, titles }) => {
+    const key = artistKeyOf(name);
+    if (!key || key in photos) return;
+    const url = await lookupArtistPhoto(name, Array.isArray(titles) ? titles.slice(0, 8) : []).catch(() => '');
+    results[key] = url || '';
+  }));
+  Object.assign(photos, results);
+  await setKV(env, 'artistPhotos', photos);
+  return json({ photos: results });
+}
+
+async function lookupArtistPhoto(name, titles) {
+  const na = norm(name);
+  const nts = titles.map(norm).filter(Boolean);
+  if (!na || !nts.length) return '';
+  const nameOk = (x) => { const n = norm(x); return n === na || similarity(n, na) >= 0.85; };
+  const titleOk = (x) => { const n = norm(x); return nts.some((t) => n === t || similarity(n, t) >= 0.8 || n.startsWith(t + ' ')); };
+  // Search "artist + song" for up to 3 of your songs at once; the first real match wins.
+  const lists = await Promise.all(titles.slice(0, 3).map((t) =>
+    fetch(`https://api.deezer.com/search?limit=15&q=${encodeURIComponent(`${name} ${t}`)}`)
+      .then((r) => (r.ok ? r.json() : {}))
+      .then((d) => d.data || [])
+      .catch(() => [])));
+  const hit = lists.flat().find((r) => r.artist && nameOk(r.artist.name) && titleOk(r.title) && realPhoto(r.artist.picture_xl));
+  return hit ? hit.artist.picture_xl : '';
+}
+
+async function getArtistPhoto(url, env) {
+  const key = artistKeyOf(url.searchParams.get('name'));
+  const photos = await getKV(env, 'artistPhotos', {});
+  if (!photos[key]) return json({ error: 'No photo' }, 404);
+  const res = await fetch(photos[key]);
+  if (!res.ok) return json({ error: `Photo download failed (${res.status})` }, 502);
+  return new Response(res.body, {
+    headers: { 'content-type': res.headers.get('content-type') || 'image/jpeg', 'cache-control': 'private, max-age=86400' },
+  });
+}
+
+// You pick the photo in the app ('' = no photo, use a song cover instead).
+async function setArtistPhoto(request, env) {
+  const body = await request.json().catch(() => ({}));
+  const key = artistKeyOf(body.name);
+  if (!key) return json({ error: 'Missing artist' }, 400);
+  let photo = '';
+  if (body.url) {
+    let host = '';
+    try { host = new URL(body.url).hostname; } catch {}
+    if (!/(^|\.)dzcdn\.net$|(^|\.)mzstatic\.com$/.test(host)) return json({ error: 'Unsupported image' }, 400);
+    photo = body.url;
+  }
+  const photos = await getKV(env, 'artistPhotos', {});
+  photos[key] = photo;
+  await setKV(env, 'artistPhotos', photos);
+  return json({ key, url: photo });
+}
+
+async function artistPhotoOptions(url) {
+  const q = clean(url.searchParams.get('q'), 120);
+  if (!q) return json({ options: [] });
+  const res = await fetch(`https://api.deezer.com/search/artist?limit=24&q=${encodeURIComponent(q)}`);
+  const data = res.ok ? await res.json() : {};
+  const options = (data.data || [])
+    .filter((a) => realPhoto(a.picture_xl))
+    .map((a) => ({ title: a.name, artist: `${(a.nb_fan || 0).toLocaleString('en')} fans`, art: a.picture_xl }));
+  return json({ query: q, options });
 }
 
 // Searches Apple Music (iTunes Search) and Deezer, both free with no key.

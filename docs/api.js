@@ -66,6 +66,16 @@ export const coverOptions = async (s, id, q) =>
 export const setCover = async (s, id, url) =>
   (await call(s, `/tracks/${id}/cover`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url }) })).json();
 
+export const findArtistPhotos = async (s, artists) =>
+  (await call(s, '/artist-photos/find', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ artists }) })).json();
+
+export const getArtistPhoto = async (s, name) => (await call(s, `/artist-photo?name=${encodeURIComponent(name)}`)).blob();
+
+export const setArtistPhoto = async (s, name, url) =>
+  (await call(s, '/artist-photo', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name, url }) })).json();
+
+export const artistPhotoOptions = async (s, q) => (await call(s, `/artist-photo/options?q=${encodeURIComponent(q)}`)).json();
+
 export const findMissingCovers = async (s) => (await call(s, '/covers/find-missing', { method: 'POST' })).json();
 
 export const connectTelegram = async (s) => (await call(s, '/telegram/setup', { method: 'POST' })).json();
