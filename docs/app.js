@@ -3,7 +3,7 @@ import * as api from './api.js';
 import { player } from './player.js';
 import { icon } from './icons.js';
 
-const APP_VERSION = 'v13'; // keep in sync with VERSION in sw.js
+const APP_VERSION = 'v14'; // keep in sync with VERSION in sw.js
 
 // ---------- helpers ----------
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -1568,6 +1568,30 @@ async function editTrack(t) {
   renderView();
   renderPlayer();
   if (player.currentId === t.id) player.updateMetadata();
+
+  // Genre left empty: look the song up again with the corrected title/artist.
+  if (!t.genre && configured() && cloudCopy(t.id) && navigator.onLine) {
+    try {
+      await api.updateTrack(state.settings, t); // the server needs the new title first
+      state.pending.renames = state.pending.renames.filter((x) => x !== t.id);
+      await savePending();
+      toast('Looking up genre…');
+      const r = await api.lookupTrack(state.settings, t.id);
+      const st = r.track;
+      const gotCover = st.cover && st.cover !== t.cover;
+      t.genre = st.genre || '';
+      t.cover = st.cover;
+      await db.put('tracks', t);
+      renderView();
+      renderPlayer();
+      if (player.currentId === t.id) player.updateMetadata();
+      if (t.genre) toast(`Genre: ${t.genre}${gotCover ? ' · cover added' : ''}`);
+      else toast(r.retry ? 'Music search is busy — try again in a minute' : 'No genre found — you can type one in Edit');
+    } catch (err) {
+      toast(err.message);
+    }
+    return;
+  }
   scheduleSync();
 }
 

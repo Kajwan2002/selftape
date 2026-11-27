@@ -52,6 +52,8 @@ export const updateTrack = (s, t) =>
 
 export const saveFeatures = (s, id, features) => call(s, `/tracks/${id}`, { method: 'PATCH', ...jsonBody({ features }) });
 
+export const lookupTrack = async (s, id) => (await call(s, `/tracks/${id}/lookup`, { method: 'POST' })).json();
+
 export const findMissingGenres = async (s) => (await call(s, '/genres/find-missing', { method: 'POST' })).json();
 
 export const deleteTrack = (s, id) => call(s, `/tracks/${id}`, { method: 'DELETE' });

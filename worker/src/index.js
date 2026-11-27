@@ -65,6 +65,7 @@ async function route(request, env, ctx, url) {
     if (parts.length === 3 && parts[2] === 'cover' && method === 'GET') return getCover(id, env);
     if (parts.length === 3 && parts[2] === 'cover' && method === 'DELETE') return removeCover(id, env);
     if (parts.length === 4 && parts[2] === 'cover' && parts[3] === 'find' && method === 'POST') return findCoverFor(id, env);
+    if (parts.length === 3 && parts[2] === 'lookup' && method === 'POST') return lookupOne(id, env);
     if (parts.length === 4 && parts[2] === 'cover' && parts[3] === 'options' && method === 'GET') return coverOptions(id, url, env);
     if (parts.length === 3 && parts[2] === 'cover' && method === 'PUT') return setCover(id, request, env);
     if (parts.length === 2 && method === 'PATCH') return updateTrack(id, request, env);
@@ -314,6 +315,19 @@ async function findMissingCovers(env) {
 }
 
 // Fills in genres for songs added before genres existed (the app calls this until remaining is 0).
+// Look one song up again (after you fixed its title/artist): fills in the genre,
+// and the cover too if it has none. Nothing you set yourself is overwritten.
+async function lookupOne(id, env) {
+  const row = await getRow(env, id);
+  if (!row) return json({ error: 'Not found' }, 404);
+  const m = await lookupMatch(row.artist, row.title).catch(() => null);
+  const genre = row.genre || m?.genre || null;
+  const coverUrl = !row.cover_file_id && !row.cover_url && m?.art ? m.art : row.cover_url;
+  await env.DB.prepare('UPDATE tracks SET genre = ?, genre_checked = ?, cover_url = ?, cover_checked = 1 WHERE id = ?')
+    .bind(genre, m?.retry ? null : 1, coverUrl, id).run();
+  return json({ track: toTrack({ ...row, genre, cover_url: coverUrl }), matched: !!m?.art, retry: !!m?.retry });
+}
+
 async function findMissingGenres(env) {
   const where = 'genre_checked IS NULL';
   let retry = 0;
