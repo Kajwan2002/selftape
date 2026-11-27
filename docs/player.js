@@ -39,7 +39,7 @@ class Player extends EventTarget {
     this.unlocked = false;
     this.url = null;
     this.token = 0;
-    this.hooks = { getBlob: null, getTrack: () => null, onError: () => {}, onDuration: () => {} };
+    this.hooks = { getBlob: null, getTrack: () => null, getArtwork: () => null, onError: () => {}, onDuration: () => {} };
 
     const a = this.audio;
     a.addEventListener('ended', () => { if (!this.isSilent) this.next(true); });
@@ -255,14 +255,17 @@ class Player extends EventTarget {
     if (!ms || !t || !window.MediaMetadata) return;
     this.bindMediaSession();
     const base = new URL('icons/', location.href).href;
+    const cover = this.hooks.getArtwork(t.id);
     ms.metadata = new MediaMetadata({
       title: t.title,
       artist: t.artist || 'Me',
       album: 'Selftape',
-      artwork: [
-        { src: base + 'icon-192.png', sizes: '192x192', type: 'image/png' },
-        { src: base + 'icon-512.png', sizes: '512x512', type: 'image/png' },
-      ],
+      artwork: cover
+        ? [{ src: cover, sizes: '600x600', type: 'image/jpeg' }]
+        : [
+            { src: base + 'icon-192.png', sizes: '192x192', type: 'image/png' },
+            { src: base + 'icon-512.png', sizes: '512x512', type: 'image/png' },
+          ],
     });
   }
 

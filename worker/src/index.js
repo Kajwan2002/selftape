@@ -49,6 +49,7 @@ async function route(request, env, ctx, url) {
   if (pathname === '/library' && method === 'GET') return getLibrary(env);
   if (pathname === '/playlists' && method === 'PUT') return putPlaylists(request, env);
   if (pathname === '/telegram/setup' && method === 'POST') return setupTelegram(env, url);
+  if (pathname === '/covers/find-missing' && method === 'POST') return findMissingCovers(env);
 
   const parts = pathname.split('/').filter(Boolean);
   if (parts[0] === 'tracks') {
@@ -56,6 +57,9 @@ async function route(request, env, ctx, url) {
     const id = parts[1] || '';
     if (!ID_RE.test(id)) return json({ error: 'Bad track id' }, 400);
     if (parts.length === 3 && parts[2] === 'audio' && method === 'GET') return getAudio(id, env);
+    if (parts.length === 3 && parts[2] === 'cover' && method === 'GET') return getCover(id, env);
+    if (parts.length === 3 && parts[2] === 'cover' && method === 'DELETE') return removeCover(id, env);
+    if (parts.length === 4 && parts[2] === 'cover' && parts[3] === 'find' && method === 'POST') return findCoverFor(id, env);
     if (parts.length === 2 && method === 'PATCH') return updateTrack(id, request, env);
     if (parts.length === 2 && method === 'DELETE') {
       // Only removes it from Selftape; the Telegram message is left alone.
@@ -80,6 +84,10 @@ async function ensureSchema(env) {
     env.DB.prepare('CREATE INDEX IF NOT EXISTS tracks_file_unique ON tracks(file_unique_id)'),
     env.DB.prepare('CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)'),
   ]);
+  // Columns added after the first release (ignore "duplicate column" errors).
+  for (const col of ['cover_file_id TEXT', 'cover_url TEXT', 'cover_checked INTEGER']) {
+    try { await env.DB.prepare(`ALTER TABLE tracks ADD COLUMN ${col}`).run(); } catch {}
+  }
   schemaReady = true;
 }
 
@@ -96,10 +104,11 @@ function setKV(env, key, value) {
 const getTgConfig = (env) => getKV(env, 'telegram', { ownerIds: [] });
 
 function insertTrack(env, t) {
-  return env.DB.prepare(`INSERT INTO tracks (id, title, artist, duration, size, type, added_at, source, file_id, file_unique_id, chat_id, message_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+  return env.DB.prepare(`INSERT INTO tracks (id, title, artist, duration, size, type, added_at, source, file_id, file_unique_id, chat_id, message_id, cover_file_id, cover_url, cover_checked)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
     .bind(t.id, t.title, t.artist || '', t.duration || 0, t.size || 0, t.type, t.addedAt, t.source,
-      t.fileId, t.fileUniqueId || null, t.chatId != null ? String(t.chatId) : null, t.messageId ?? null)
+      t.fileId, t.fileUniqueId || null, t.chatId != null ? String(t.chatId) : null, t.messageId ?? null,
+      t.coverFileId || null, t.coverUrl || null, t.coverChecked ? 1 : null)
     .run();
 }
 
@@ -108,7 +117,17 @@ const getRow = (env, id) => env.DB.prepare('SELECT * FROM tracks WHERE id = ?').
 const toTrack = (r) => ({
   id: r.id, title: r.title, artist: r.artist, duration: r.duration, size: r.size,
   type: r.type, addedAt: r.added_at, source: r.source,
+  cover: coverKey(r),
 });
+
+// A short key that changes whenever the cover changes, so the app knows to refetch it.
+function coverKey(r) {
+  const src = r.cover_file_id || r.coverFileId || r.cover_url || r.coverUrl;
+  if (!src) return null;
+  let h = 0;
+  for (const c of src) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return h.toString(36);
+}
 
 // ---------- library ----------
 
@@ -191,7 +210,12 @@ async function uploadTrack(request, env) {
     source: 'app',
     fileId: file.file_id, fileUniqueId: file.file_unique_id,
     chatId: target, messageId: msg.message_id,
+    coverFileId: file.thumbnail?.file_id || null,
   };
+  if (!track.coverFileId) {
+    track.coverUrl = await lookupCover(artist, title).catch(() => null);
+    track.coverChecked = true;
+  }
   await insertTrack(env, track);
   return json(toTrack({ ...track, added_at: track.addedAt }));
 }
@@ -217,6 +241,111 @@ async function updateTrack(id, request, env) {
   const duration = !row.duration && Number(body.duration) ? Number(body.duration) : row.duration;
   await env.DB.prepare('UPDATE tracks SET title = ?, artist = ?, duration = ? WHERE id = ?').bind(title, artist, duration, id).run();
   return json(toTrack({ ...row, title, artist, duration }));
+}
+
+// ---------- cover art ----------
+
+async function getCover(id, env) {
+  const row = await getRow(env, id);
+  if (!row || (!row.cover_file_id && !row.cover_url)) return json({ error: 'No cover' }, 404);
+  let res;
+  if (row.cover_file_id) {
+    const info = await tg(env, 'getFile', { file_id: row.cover_file_id });
+    res = await fetch(`https://api.telegram.org/file/bot${env.BOT_TOKEN}/${info.file_path}`);
+  } else {
+    res = await fetch(row.cover_url);
+  }
+  if (!res.ok) return json({ error: `Cover download failed (${res.status})` }, 502);
+  return new Response(res.body, {
+    headers: { 'content-type': res.headers.get('content-type') || 'image/jpeg', 'cache-control': 'private, max-age=86400' },
+  });
+}
+
+async function removeCover(id, env) {
+  await env.DB.prepare('UPDATE tracks SET cover_file_id = NULL, cover_url = NULL, cover_checked = 1 WHERE id = ?').bind(id).run();
+  const row = await getRow(env, id);
+  return row ? json(toTrack(row)) : json({ error: 'Not found' }, 404);
+}
+
+async function findCoverFor(id, env) {
+  const row = await getRow(env, id);
+  if (!row) return json({ error: 'Not found' }, 404);
+  const url = await lookupCover(row.artist, row.title);
+  if (!url) {
+    return json({ error: `No matching cover found for “${row.title}”${row.artist ? '' : ' (add the artist name first)'}` }, 404);
+  }
+  await env.DB.prepare('UPDATE tracks SET cover_url = ?, cover_file_id = NULL, cover_checked = 1 WHERE id = ?').bind(url, id).run();
+  return json(toTrack({ ...row, cover_url: url, cover_file_id: null }));
+}
+
+// Checks a batch of tracks that never had a cover lookup; the app calls this until remaining is 0.
+async function findMissingCovers(env) {
+  const where = 'cover_file_id IS NULL AND cover_url IS NULL AND cover_checked IS NULL';
+  const { results } = await env.DB.prepare(`SELECT id, title, artist FROM tracks WHERE ${where} LIMIT 10`).all();
+  let found = 0;
+  for (const r of results) {
+    const url = await lookupCover(r.artist, r.title).catch(() => null);
+    if (url) found++;
+    await env.DB.prepare('UPDATE tracks SET cover_url = ?, cover_checked = 1 WHERE id = ?').bind(url, r.id).run();
+  }
+  const left = await env.DB.prepare(`SELECT COUNT(*) AS n FROM tracks WHERE ${where}`).first();
+  return json({ checked: results.length, found, remaining: left.n });
+}
+
+// Looks the song up on Apple Music (iTunes Search) and Deezer, both free with no key.
+// Only accepts a result when the artist AND the title match, so songs that
+// aren't released anywhere don't get a random wrong cover.
+async function lookupCover(artist, title) {
+  let a = artist;
+  let t = title;
+  if (!a && / - /.test(t)) [a, t] = t.split(/ - (.*)/s); // "Artist - Song" titles
+  const na = norm(a);
+  const nt = norm(t);
+  if (!na || !nt) return null;
+  const artistOk = (x) => { const n = norm(x); return !!n && (n === na || n.includes(na) || na.includes(n)); };
+  // Versions we skip unless the title asks for them (so "Song" doesn't get the remix cover).
+  const VERSION_WORDS = /\b(remix|mix|live|acoustic|instrumental|karaoke|sped up|slowed|reverb|cover|version|edit|demo)\b/;
+  const wantsVersion = VERSION_WORDS.test(String(title || '').toLowerCase());
+  // 2 = exact title, 1 = close (extra words), 0 = no match
+  const score = (rawTitle, rawArtist) => {
+    if (!artistOk(rawArtist)) return 0;
+    const full = String(rawTitle || '').toLowerCase();
+    if (!wantsVersion && VERSION_WORDS.test(full.normalize('NFKD').replace(/[̀-ͯ]/g, ''))) return 0;
+    const n = norm(rawTitle);
+    if (n === nt) return 2;
+    return n.startsWith(nt + ' ') || nt.startsWith(n + ' ') ? 1 : 0;
+  };
+  const best = (items, getTitle, getArtist) =>
+    items.map((r) => [score(getTitle(r), getArtist(r)), r]).filter(([s]) => s > 0).sort((x, y) => y[0] - x[0])[0]?.[1];
+
+  try {
+    const res = await fetch(`https://itunes.apple.com/search?entity=song&limit=25&term=${encodeURIComponent(`${a} ${t}`)}`);
+    if (res.ok) {
+      const data = await res.json();
+      const hit = best(data.results || [], (r) => r.trackName, (r) => r.artistName);
+      if (hit?.artworkUrl100) return hit.artworkUrl100.replace(/\/\d+x\d+bb\./, '/600x600bb.');
+    }
+  } catch {}
+  try {
+    const res = await fetch(`https://api.deezer.com/search?limit=25&q=${encodeURIComponent(`artist:"${a}" track:"${t}"`)}`);
+    if (res.ok) {
+      const data = await res.json();
+      const hit = best(data.data || [], (r) => r.title, (r) => r.artist?.name);
+      if (hit?.album?.cover_xl) return hit.album.cover_xl;
+    }
+  } catch {}
+  return null;
+}
+
+function norm(s) {
+  return String(s || '')
+    .toLowerCase()
+    .normalize('NFKD').replace(/[̀-ͯ]/g, '')
+    .replace(/\(.*?\)|\[.*?\]/g, ' ') // (feat. …), [Remastered]
+    .replace(/\s(feat|ft)\.?\s.*$/, ' ')
+    .replace(/&/g, ' and ')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim();
 }
 
 // ---------- telegram ----------
@@ -374,10 +503,17 @@ async function addFromMessage(env, msg, cfg, { source, archive }) {
     clean(file.title) || clean(msg.caption) || clean(stripExt(name)) ||
     (file.kind === 'voice' ? `Voice memo ${new Date(msg.date * 1000).toISOString().slice(0, 16).replace('T', ' ')}` : 'Untitled');
 
+  const artist = clean(file.performer, 60);
+  const coverFileId = file.thumbnail?.file_id || file.thumb?.file_id || null;
+  const coverUrl = coverFileId ? null : await lookupCover(artist, title).catch(() => null);
+
   await insertTrack(env, {
     id: crypto.randomUUID(),
     title,
-    artist: clean(file.performer, 60),
+    artist,
+    coverFileId,
+    coverUrl,
+    coverChecked: true,
     duration: file.duration || 0,
     size: file.file_size || 0,
     type,

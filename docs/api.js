@@ -54,4 +54,12 @@ export const deleteTrack = (s, id) => call(s, `/tracks/${id}`, { method: 'DELETE
 
 export const savePlaylists = (s, data) => call(s, '/playlists', { method: 'PUT', ...jsonBody(data) });
 
+export const getCover = async (s, id) => (await call(s, `/tracks/${id}/cover`)).blob();
+
+export const findCover = async (s, id) => (await call(s, `/tracks/${id}/cover/find`, { method: 'POST' })).json();
+
+export const removeCover = async (s, id) => (await call(s, `/tracks/${id}/cover`, { method: 'DELETE' })).json();
+
+export const findMissingCovers = async (s) => (await call(s, '/covers/find-missing', { method: 'POST' })).json();
+
 export const connectTelegram = async (s) => (await call(s, '/telegram/setup', { method: 'POST' })).json();

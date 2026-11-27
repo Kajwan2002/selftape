@@ -1,6 +1,34 @@
 {
   "version": "0.0.1",
   "configurations": [
-    { "name": "api", "runtimeExecutable": "npx", "runtimeArgs": ["--prefix", "worker", "wrangler", "dev", "--cwd", "worker", "--port", "8787", "--var", "ALLOWED_ORIGIN:*"], "port": 8787 }
+    {
+      "name": "api",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": [
+        "--prefix",
+        "worker",
+        "wrangler",
+        "dev",
+        "--cwd",
+        "worker",
+        "--port",
+        "8787",
+        "--var",
+        "ALLOWED_ORIGIN:*"
+      ],
+      "port": 8787
+    },
+    {
+      "name": "app",
+      "runtimeExecutable": "python",
+      "runtimeArgs": [
+        "-m",
+        "http.server",
+        "5501",
+        "--directory",
+        "docs"
+      ],
+      "port": 5501
+    }
   ]
 }

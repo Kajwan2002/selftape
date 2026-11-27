@@ -3,7 +3,7 @@ import * as api from './api.js';
 import { player } from './player.js';
 import { icon } from './icons.js';
 
-const APP_VERSION = 'v4'; // keep in sync with VERSION in sw.js
+const APP_VERSION = 'v5'; // keep in sync with VERSION in sw.js
 
 // ---------- helpers ----------
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -18,10 +18,17 @@ const fmtTotal = (s) => {
   const m = Math.round(s / 60);
   return m >= 60 ? `${Math.floor(m / 60)} h ${m % 60} min` : `${m} min`;
 };
-const fmtBytes = (b) => (b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : b >= 1e6 ? `${Math.round(b / 1e6)} MB` : `${Math.round(b / 1e3)} KB`);
+const fmtBytes = (b) => (b >= 1073741824 ? `${(b / 1073741824).toFixed(1)} GB` : b >= 1048576 ? `${Math.round(b / 1048576)} MB` : `${Math.round(b / 1024)} KB`);
 const hue = (id) => { let h = 0; for (const c of String(id)) h = (h * 31 + c.charCodeAt(0)) >>> 0; return h % 360; };
 const initial = (s) => ([...String(s || '').trim()][0] || '♪').toUpperCase();
-const art = (id, name, cls = '') => `<div class="art ${cls}" style="--h:${hue(id)}">${esc(initial(name))}</div>`;
+// Artwork tile: the cover image when there is one, otherwise a coloured letter.
+// coverId lets a playlist borrow a track's cover.
+const art = (id, name, cls = '', coverId = id) => {
+  const url = coverUrlFor(coverId);
+  if (url) return `<div class="art has-img ${cls}" style="--h:${hue(id)};background-image:url('${url}')"></div>`;
+  const wants = state.tracks.get(coverId)?.cover;
+  return `<div class="art ${cls}" style="--h:${hue(id)}"${wants ? ` data-cover="${coverId}"` : ''}>${esc(initial(name))}</div>`;
+};
 const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
 const newestFirst = (a, b) => b.addedAt - a.addedAt;
 
@@ -40,7 +47,7 @@ const state = {
   downloaded: new Set(),
   downloading: new Set(),
   playlists: { updatedAt: 0, items: [] },
-  settings: { serverUrl: '', token: '', autoDownload: true, sort: 'new', libraryId: '' },
+  settings: { serverUrl: '', token: '', autoDownload: true, sort: 'new', libraryId: '', storageLimitMB: 1024 },
   pending: { uploads: [], deletes: [], renames: [], playlistsDirty: false },
   view: { name: 'library' },
   search: '',
@@ -56,6 +63,7 @@ const saveSettings = () => db.put('kv', state.settings, 'settings');
 const savePending = () => db.put('kv', state.pending, 'pending');
 const savePlaylistsLocal = () => db.put('kv', state.playlists, 'playlists');
 const findPlaylist = (id) => state.playlists.items.find((p) => p.id === id);
+const playlistCoverId = (pl) => pl.trackIds.find((id) => state.tracks.get(id)?.cover) || pl.id;
 const playlistTracks = (pl) => pl.trackIds.map((id) => state.tracks.get(id)).filter(Boolean);
 const isPendingUpload = (id) => state.pending.uploads.includes(id);
 const isLocalOnly = (id) => !!state.tracks.get(id)?.localOnly;
@@ -68,6 +76,114 @@ function changePlaylists(fn) {
   savePlaylistsLocal();
   savePending();
   scheduleSync();
+}
+
+// ---------- cover art ----------
+// Covers are fetched from the server once and kept on the phone (works offline).
+const coverUrls = new Map(); // track id -> { key, url }
+const coverJobs = new Map();
+let coverActive = 0;
+const coverQueue = [];
+
+function coverUrlFor(id) {
+  const t = state.tracks.get(id);
+  const c = t?.cover && coverUrls.get(id);
+  return c && c.key === t.cover ? c.url : null;
+}
+
+function limited(fn) {
+  return new Promise((resolve, reject) => {
+    coverQueue.push(() => fn().then(resolve, reject));
+    pumpCovers();
+  });
+}
+function pumpCovers() {
+  while (coverActive < 4 && coverQueue.length) {
+    coverActive++;
+    coverQueue.shift()().finally(() => { coverActive--; pumpCovers(); });
+  }
+}
+
+function loadCover(id) {
+  const t = state.tracks.get(id);
+  if (!t?.cover) return Promise.resolve(null);
+  const ready = coverUrlFor(id);
+  if (ready) return Promise.resolve(ready);
+  if (coverJobs.has(id)) return coverJobs.get(id);
+  const job = (async () => {
+    let rec = await db.get('kv', `cover:${id}`);
+    if (!rec || rec.key !== t.cover) {
+      if (!configured() || !navigator.onLine) return null;
+      const blob = await limited(() => api.getCover(state.settings, id)).catch(() => null);
+      if (!blob) return null;
+      rec = { key: t.cover, blob };
+      await db.put('kv', rec, `cover:${id}`);
+    }
+    const old = coverUrls.get(id);
+    if (old) URL.revokeObjectURL(old.url);
+    const url = URL.createObjectURL(rec.blob);
+    coverUrls.set(id, { key: rec.key, url });
+    if (id === player.currentId) { paintPlayerArt(); player.updateMetadata(); }
+    return url;
+  })().finally(() => coverJobs.delete(id));
+  coverJobs.set(id, job);
+  return job;
+}
+
+function hydrateCovers(root = document) {
+  $$('[data-cover]', root).forEach((el) => {
+    const id = el.dataset.cover;
+    el.removeAttribute('data-cover');
+    loadCover(id).then((url) => {
+      if (!url || !el.isConnected) return;
+      el.classList.add('has-img');
+      el.style.backgroundImage = `url('${url}')`;
+      el.textContent = '';
+    });
+  });
+}
+
+function paintArt(el, t) {
+  const url = coverUrlFor(t.id);
+  el.style.setProperty('--h', hue(t.id));
+  el.classList.toggle('has-img', !!url);
+  el.style.backgroundImage = url ? `url('${url}')` : '';
+  el.textContent = url ? '' : initial(t.title);
+  if (!url && t.cover) loadCover(t.id);
+}
+
+function paintPlayerArt() {
+  const t = state.tracks.get(player.currentId);
+  if (!t) return;
+  paintArt($('#miniArt'), t);
+  paintArt($('#pArt'), t);
+}
+
+function applyServerTrack(st) {
+  const t = state.tracks.get(st.id);
+  if (!t) return;
+  t.cover = st.cover;
+  db.put('tracks', t);
+  renderView();
+  renderPlayer();
+  if (st.id === player.currentId) player.updateMetadata();
+}
+
+async function findMissingCovers() {
+  try {
+    toast('Looking for covers…');
+    let found = 0;
+    for (let i = 0; i < 100; i++) {
+      const r = await api.findMissingCovers(state.settings);
+      found += r.found;
+      if (!r.remaining || !r.checked) break;
+      toast(`Looking for covers… ${r.remaining} left`);
+    }
+    toast(found ? `Found ${plural(found, 'cover')}` : 'No new covers found');
+    await sync();
+  } catch (err) {
+    toast(err.message);
+  }
 }
 
 // ---------- audio files ----------
@@ -87,6 +203,8 @@ async function ensureBlob(id) {
       if (t?.type && blob.type !== t.type) blob = new Blob([blob], { type: t.type });
       await db.put('blobs', blob, id);
       state.downloaded.add(id);
+      if (t && t.size !== blob.size) { t.size = blob.size; await db.put('tracks', t); }
+      await enforceStorageLimit(id);
       return blob;
     } finally {
       state.downloading.delete(id);
@@ -98,15 +216,58 @@ async function ensureBlob(id) {
   return job;
 }
 
+// ---------- storage limit ----------
+// Downloads are capped (1 GB by default). When the phone goes over, the tracks
+// you played longest ago are removed from the phone; they stay in Telegram and
+// download again when you play them.
+const limitBytes = () => (state.settings.storageLimitMB > 0 ? state.settings.storageLimitMB * 1048576 : Infinity);
+const downloadedBytes = () => [...state.downloaded].reduce((sum, id) => sum + (state.tracks.get(id)?.size || 0), 0);
+const lastUsed = (t) => t.lastPlayed || t.addedAt || 0;
+
+async function enforceStorageLimit(keepId) {
+  const limit = limitBytes();
+  let used = downloadedBytes();
+  if (used <= limit) return;
+  // Never remove: what's playing, the next two in the queue, the track just
+  // downloaded, and files that only exist on this phone.
+  const keep = new Set([keepId, ...player.queue.slice(Math.max(0, player.index), player.index + 3)]);
+  const candidates = [...state.downloaded]
+    .map((id) => state.tracks.get(id))
+    .filter((t) => t && !keep.has(t.id) && cloudCopy(t.id))
+    .sort((a, b) => lastUsed(a) - lastUsed(b));
+  for (const t of candidates) {
+    if (used <= limit) break;
+    await db.del('blobs', t.id);
+    state.downloaded.delete(t.id);
+    used -= t.size || 0;
+    updateStatus(t.id);
+  }
+  refreshStorageInfo();
+}
+
+function markPlayed(id) {
+  const t = state.tracks.get(id);
+  if (!t) return;
+  t.lastPlayed = Date.now();
+  db.put('tracks', t);
+}
+
 let bgRunning = false;
 async function backgroundDownload(loud = false) {
   if (bgRunning || !configured()) return;
   bgRunning = true;
   try {
+    // Fill the phone up to the limit with your newest tracks, without pushing
+    // out anything (so it never downloads and deletes in a loop).
+    let used = downloadedBytes();
     for (const t of [...state.tracks.values()].sort(newestFirst)) {
       if (!navigator.onLine) break;
       if (state.downloaded.has(t.id)) continue;
-      try { await ensureBlob(t.id); } catch (err) { if (loud) toast(err.message); break; }
+      if (used + (t.size || 0) > limitBytes()) {
+        if (loud) toast('Storage limit reached — change it in Settings');
+        break;
+      }
+      try { await ensureBlob(t.id); used = downloadedBytes(); } catch (err) { if (loud) toast(err.message); break; }
     }
   } finally {
     bgRunning = false;
@@ -164,6 +325,7 @@ async function importFiles(files) {
 }
 
 async function removeTrackLocally(id) {
+  db.del('kv', `cover:${id}`);
   state.tracks.delete(id);
   state.downloaded.delete(id);
   await db.del('tracks', id);
@@ -263,7 +425,7 @@ async function sync(manual = false) {
       if (p.renames.includes(st.id)) continue;
       const lt = state.tracks.get(st.id);
       const merged = { ...lt, ...st, duration: st.duration || lt?.duration || 0 };
-      if (!lt || lt.title !== merged.title || lt.artist !== merged.artist || lt.duration !== merged.duration || lt.size !== merged.size) {
+      if (!lt || lt.title !== merged.title || lt.artist !== merged.artist || lt.duration !== merged.duration || lt.size !== merged.size || lt.cover !== merged.cover) {
         state.tracks.set(st.id, merged);
         await db.put('tracks', merged);
         changed = true;
@@ -312,11 +474,13 @@ function renderView() {
   } else if (v.name === 'playlists') {
     $('#pageTitle').textContent = 'Playlists';
     el.innerHTML = playlistsHTML();
+    hydrateCovers(el);
   } else if (v.name === 'playlist') {
     const pl = findPlaylist(v.id);
     if (!pl) { state.view = { name: 'playlists' }; return renderView(); }
     $('#pageTitle').textContent = 'Playlists';
     el.innerHTML = playlistHTML(pl);
+    hydrateCovers(el);
     renderList();
   } else {
     $('#pageTitle').textContent = 'Settings';
@@ -352,7 +516,7 @@ function playlistsHTML() {
   const rows = items.map((pl) => {
     const n = playlistTracks(pl).length;
     return `<div class="row" data-action="open-playlist" data-id="${esc(pl.id)}">
-      ${art(pl.id, pl.name)}
+      ${art(pl.id, pl.name, '', playlistCoverId(pl))}
       <div class="meta"><div class="t">${esc(pl.name)}</div><div class="s">${plural(n, 'track')}</div></div>
       <span class="chev">${icon('chevron-right')}</span>
     </div>`;
@@ -369,7 +533,7 @@ function playlistHTML(pl) {
   return `
     <button class="back" data-action="tab" data-tab="playlists">${icon('chevron-left')} Playlists</button>
     <div class="pl-head">
-      ${art(pl.id, pl.name, 'big')}
+      ${art(pl.id, pl.name, 'big', playlistCoverId(pl))}
       <div class="meta"><h2>${esc(pl.name)}</h2><div class="muted small">${plural(ts.length, 'track')}${total ? ` · ${fmtTotal(total)}` : ''}</div></div>
     </div>
     <div class="actions-row">
@@ -405,11 +569,17 @@ function settingsHTML() {
     <section class="card">
       <h3>On this phone</h3>
       <label class="toggle"><span>Download new tracks automatically</span><input type="checkbox" id="autoDownload" ${s.autoDownload ? 'checked' : ''}></label>
+      <label class="toggle"><span>Max storage on this phone</span>
+        <select id="storageLimit" class="select">
+          ${[[512, '500 MB'], [1024, '1 GB'], [2048, '2 GB'], [5120, '5 GB'], [0, 'No limit']].map(([v, l]) => `<option value="${v}" ${Number(s.storageLimitMB) === v ? 'selected' : ''}>${l}</option>`).join('')}
+        </select></label>
+      <p class="muted small">When it's full, the songs you played longest ago are removed from the phone. They stay in Telegram and download again when you play them.</p>
       <p class="muted small" id="storageInfo">&nbsp;</p>
       <div class="row-btns">
         <button class="pill" data-action="import">${icon('file')} Import from Files</button>
         ${configured() ? `<button class="pill" data-action="download-all">${icon('download')} Download all</button>
-        <button class="pill" data-action="remove-downloads">Free up space</button>` : ''}
+        <button class="pill" data-action="remove-downloads">Free up space</button>
+        <button class="pill" data-action="find-covers">${icon('search')} Find missing covers</button>` : ''}
       </div>
     </section>
     <section class="card">
@@ -463,6 +633,7 @@ function renderList() {
     });
     el.innerHTML = rows.join('') || emptyHTML('Empty playlist', 'Tap <b>Add</b> to put some tracks in.');
   }
+  hydrateCovers(el);
 }
 
 function updateStatus(id) {
@@ -494,11 +665,8 @@ async function refreshStorageInfo() {
   const el = $('#storageInfo');
   if (!el) return;
   const total = state.tracks.size;
-  let text = `${state.downloaded.size} of ${plural(total, 'track')} on this phone`;
-  try {
-    const est = await navigator.storage?.estimate?.();
-    if (est?.usage) text += ` · ${fmtBytes(est.usage)} used`;
-  } catch {}
+  const lim = limitBytes();
+  let text = `${state.downloaded.size} of ${plural(total, 'track')} on this phone · ${fmtBytes(downloadedBytes())}${isFinite(lim) ? ` of ${fmtBytes(lim)}` : ''}`;
   el.textContent = text;
 }
 
@@ -515,7 +683,8 @@ function renderPlayer() {
   const loading = player.loadingId === id;
   const playIcon = loading ? '<span class="spinner"></span>' : icon(player.playing ? 'pause' : 'play');
   const h = hue(t.id);
-  for (const el of [$('#miniArt'), $('#pArt')]) { el.style.setProperty('--h', h); el.textContent = initial(t.title); }
+  paintArt($('#miniArt'), t);
+  paintArt($('#pArt'), t);
   $('#player').style.setProperty('--h', h);
   $('#miniTitle').textContent = $('#pTitle').textContent = t.title;
   $('#miniArtist').textContent = t.artist || (loading ? 'Loading…' : '');
@@ -536,6 +705,7 @@ function renderPlayer() {
         </div>`;
       }).join('')
     : '<p class="muted small">Nothing queued.</p>';
+  hydrateCovers($('#upnext'));
   renderTime();
 }
 
@@ -629,6 +799,7 @@ function picker(title, tracks) {
       <div class="pick-list">${tracks.map((t) => `<label class="row pick"><input type="checkbox" value="${t.id}">${art(t.id, t.title)}<div class="meta"><div class="t">${esc(t.title)}</div><div class="s">${esc(t.artist || fmtTime(t.duration))}</div></div></label>`).join('')}</div>
       <div class="sheet-foot"><button class="pill" data-cancel>Cancel</button><button class="pill primary" data-done>Add</button></div>`, resolve);
     const sheet = $('#sheet');
+    hydrateCovers(sheet);
     sheet.onclick = null;
     const done = sheet.querySelector('[data-done]');
     sheet.onchange = () => {
@@ -660,6 +831,11 @@ async function trackMenu(id, index) {
     { key: 'add', label: 'Add to playlist…', icon: 'playlists' },
     { key: 'edit', label: 'Edit title & artist', icon: 'edit' },
   ];
+  if (configured() && cloudCopy(id)) {
+    items.push(t.cover
+      ? { key: 'cover-remove', label: 'Remove cover', icon: 'x' }
+      : { key: 'cover-find', label: 'Find cover art', icon: 'search' });
+  }
   if (!state.downloaded.has(id)) items.push({ key: 'download', label: 'Download to phone', icon: 'download' });
   else if (configured() && cloudCopy(id)) items.push({ key: 'undownload', label: 'Remove download', icon: 'x' });
   if (inPlaylist) {
@@ -675,6 +851,16 @@ async function trackMenu(id, index) {
     case 'queue': player.addToQueue(id); toast('Added to queue'); break;
     case 'add': await addToPlaylist(id); break;
     case 'edit': await editTrack(t); break;
+    case 'cover-find':
+      try {
+        toast('Searching…');
+        applyServerTrack(await api.findCover(state.settings, id));
+        toast('Cover found');
+      } catch (err) { toast(err.message); }
+      break;
+    case 'cover-remove':
+      try { applyServerTrack(await api.removeCover(state.settings, id)); } catch (err) { toast(err.message); }
+      break;
     case 'download': ensureBlob(id).then(() => toast('Downloaded')).catch((e) => toast(e.message)); break;
     case 'undownload':
       await db.del('blobs', id);
@@ -861,6 +1047,7 @@ function bindEvents() {
       case 'connect-telegram': connectTelegram(); break;
       case 'download-all': toast('Downloading…'); backgroundDownload(true); break;
       case 'remove-downloads': removeDownloads(); break;
+      case 'find-covers': findMissingCovers(); break;
       case 'open-player': openPlayer(); break;
       case 'close-player': closePlayer(); break;
       case 'toggle': player.toggle(); break;
@@ -892,6 +1079,11 @@ function bindEvents() {
       if (isFinite(dur)) player.seek((Number(e.target.value) / 1000) * dur);
       seeking = false;
     }
+    if (e.target.id === 'storageLimit') {
+      state.settings.storageLimitMB = Number(e.target.value);
+      saveSettings();
+      enforceStorageLimit().then(() => { if (state.settings.autoDownload) backgroundDownload(); });
+    }
     if (e.target.id === 'autoDownload') {
       state.settings.autoDownload = e.target.checked;
       saveSettings();
@@ -916,6 +1108,7 @@ function bindEvents() {
   player.addEventListener('change', renderPlayer);
   player.audio.addEventListener('timeupdate', renderTime);
   player.audio.addEventListener('durationchange', renderTime);
+  player.audio.addEventListener('playing', () => { if (!player.isSilent && player.currentId) markPlayed(player.currentId); });
 
   document.addEventListener('visibilitychange', () => { if (!document.hidden) sync(); });
   window.addEventListener('online', () => sync());
@@ -937,6 +1130,7 @@ async function init() {
   player.init({
     getBlob: ensureBlob,
     getTrack: (id) => state.tracks.get(id),
+    getArtwork: (id) => coverUrlFor(id),
     onError: (err) => toast(err.message || "Couldn't play that track"),
     onDuration: (id, d) => {
       const t = state.tracks.get(id);

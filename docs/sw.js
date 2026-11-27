@@ -1,6 +1,6 @@
 // Caches the app itself so it opens offline. Audio lives in IndexedDB, not here.
 // Bump VERSION when you change the app so phones pick up the new files.
-const VERSION = 'v4';
+const VERSION = 'v5';
 const CACHE = `selftape-${VERSION}`;
 const SHELL = [
   './', './index.html', './style.css', './app.js', './db.js', './api.js', './player.js', './icons.js',
@@ -24,7 +24,7 @@ self.addEventListener('fetch', (e) => {
   const req = e.request;
   if (req.method !== 'GET' || new URL(req.url).origin !== location.origin) return;
   e.respondWith(
-    fetch(req)
+    fetch(req, { cache: 'no-cache' }) // always revalidate so all files update together
       .then((res) => {
         if (res.ok) {
           const copy = res.clone();
