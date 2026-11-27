@@ -3,7 +3,7 @@ import * as api from './api.js';
 import { player } from './player.js';
 import { icon } from './icons.js';
 
-const APP_VERSION = 'v9'; // keep in sync with VERSION in sw.js
+const APP_VERSION = 'v10'; // keep in sync with VERSION in sw.js
 
 // ---------- helpers ----------
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -51,6 +51,8 @@ const state = {
   pending: { uploads: [], deletes: [], renames: [], playlistsDirty: false },
   view: { name: 'library' },
   search: '',
+  libTab: 'songs', // songs | artists
+  recent: [],      // [{ type: 'track'|'playlist'|'artist', id, at }]
   syncing: false,
   syncError: '',
   telegram: null,
@@ -578,7 +580,7 @@ function render() {
 }
 
 function renderTabs() {
-  const active = state.view.name === 'playlist' ? 'playlists' : state.view.name;
+  const active = state.view.name === 'playlist' ? 'playlists' : state.view.name === 'artist' ? 'library' : state.view.name;
   $('#importBtn').hidden = state.view.name !== 'library';
   $$('.tabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === active));
 }
@@ -595,6 +597,13 @@ function renderView() {
     $('#pageTitle').textContent = 'Playlists';
     el.innerHTML = playlistsHTML();
     hydrateCovers(el);
+  } else if (v.name === 'artist') {
+    const a = artistIndex().get(v.key);
+    if (!a) { state.view = { name: 'library' }; state.libTab = 'artists'; return renderView(); }
+    $('#pageTitle').textContent = 'Library';
+    el.innerHTML = artistHTML(a);
+    hydrateCovers(el);
+    renderList();
   } else if (v.name === 'playlist') {
     const pl = findPlaylist(v.id);
     if (!pl) { state.view = { name: 'playlists' }; return renderView(); }
@@ -620,15 +629,91 @@ function libraryTracks() {
 
 function libraryHTML() {
   const sortLabel = state.settings.sort === 'az' ? 'A–Z' : 'Newest';
+  const songs = state.libTab === 'songs';
   return `
-    <label class="search">${icon('search')}<input id="search" type="search" placeholder="Search your tracks" value="${esc(state.search)}" autocomplete="off" autocorrect="off"></label>
-    <div class="actions-row">
+    <label class="search">${icon('search')}<input id="search" type="search" placeholder="${songs ? 'Search your tracks' : 'Search artists'}" value="${esc(state.search)}" autocomplete="off" autocorrect="off"></label>
+    <div class="seg">
+      <button data-action="lib-tab" data-lib="songs" class="${songs ? 'on' : ''}">Songs</button>
+      <button data-action="lib-tab" data-lib="artists" class="${songs ? '' : 'on'}">Artists</button>
+    </div>
+    <div id="recent"></div>
+    ${songs ? `<div class="actions-row">
       <button class="pill primary" data-action="play-list">${icon('play')} Play</button>
       <button class="pill" data-action="shuffle-list">${icon('shuffle')} Shuffle</button>
       <span class="grow"></span>
       <button class="pill ghost" data-action="sort">${sortLabel}</button>
+    </div>` : ''}
+    <div id="list" class="list"></div>`;
+}
+
+// ---------- artists ----------
+// Songs with several artists ("A, B" or "A feat. B") show up under each of them.
+const splitArtists = (s) => String(s || '').split(/\s*(?:,|;|\/|\bfeat\.?|\bft\.?|\bfeaturing\b)\s*/i).map((x) => x.trim()).filter(Boolean);
+const artistKey = (name) => name.toLowerCase().replace(/\s+/g, ' ').trim();
+
+function artistIndex() {
+  const map = new Map();
+  for (const t of [...state.tracks.values()].sort(newestFirst)) {
+    for (const name of splitArtists(t.artist)) {
+      const key = artistKey(name);
+      if (!map.has(key)) map.set(key, { key, name, ids: [] });
+      map.get(key).ids.push(t.id);
+    }
+  }
+  return map;
+}
+
+const artistCoverId = (a) => a.ids.find((id) => state.tracks.get(id)?.cover) || a.ids[0];
+
+function artistHTML(a) {
+  const ts = a.ids.map((id) => state.tracks.get(id)).filter(Boolean);
+  const total = ts.reduce((s, t) => s + (t.duration || 0), 0);
+  return `
+    <button class="back" data-action="back-artists">${icon('chevron-left')} Artists</button>
+    <div class="pl-head">
+      ${art(a.key, a.name, 'big round', artistCoverId(a))}
+      <div class="meta"><h2>${esc(a.name)}</h2><div class="muted small">${plural(ts.length, 'track')}${total ? ` · ${fmtTotal(total)}` : ''}</div></div>
+    </div>
+    <div class="actions-row">
+      <button class="pill primary" data-action="play-list">${icon('play')} Play</button>
+      <button class="pill" data-action="shuffle-list">${icon('shuffle')} Shuffle</button>
     </div>
     <div id="list" class="list"></div>`;
+}
+
+// ---------- recently played ----------
+function addRecent(item) {
+  state.recent = [{ ...item, at: Date.now() }, ...state.recent.filter((r) => !(r.type === item.type && r.id === item.id))].slice(0, 12);
+  db.put('kv', state.recent, 'recent');
+  renderRecent();
+}
+
+function recentEntries() {
+  const artists = artistIndex();
+  return state.recent.map((r) => {
+    if (r.type === 'track') { const t = state.tracks.get(r.id); return t && { r, label: t.title, sub: t.artist || 'Song', html: art(t.id, t.title) }; }
+    if (r.type === 'playlist') { const pl = findPlaylist(r.id); return pl && { r, label: pl.name, sub: 'Playlist', html: playlistArt(pl) }; }
+    if (r.type === 'artist') { const a = artists.get(r.id); return a && { r, label: a.name, sub: 'Artist', html: art(a.key, a.name, 'round', artistCoverId(a)) }; }
+    return null;
+  }).filter(Boolean).slice(0, 10);
+}
+
+function renderRecent() {
+  const el = $('#recent');
+  if (!el) return;
+  const items = state.libTab === 'songs' && !state.search ? recentEntries() : [];
+  el.innerHTML = items.length
+    ? `<h3 class="section-title">Recently played</h3><div class="recent-row">${items.map(({ r, label, sub, html }) =>
+        `<button class="recent-item" data-action="open-recent" data-type="${r.type}" data-id="${esc(r.id)}">${html}<span class="t">${esc(label)}</span><span class="s">${esc(sub)}</span></button>`).join('')}</div>`
+    : '';
+  hydrateCovers(el);
+}
+
+// Where the play buttons on the current screen start playback from (for "Recently played").
+function currentContext() {
+  if (state.view.name === 'playlist') return { type: 'playlist', id: state.view.id };
+  if (state.view.name === 'artist') return { type: 'artist', id: state.view.key };
+  return null;
 }
 
 function playlistsHTML() {
@@ -732,7 +817,26 @@ function rowHTML(t, pos, index = '') {
 function renderList() {
   const el = $('#list');
   if (!el) return;
-  if (state.view.name === 'library') {
+  if (state.view.name === 'library' && state.libTab === 'artists') {
+    const q = state.search.trim().toLowerCase();
+    const list = [...artistIndex().values()]
+      .filter((a) => !q || a.name.toLowerCase().includes(q))
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+    listIds = [];
+    el.innerHTML = list.length
+      ? list.map((a) => `<div class="row" data-action="open-artist" data-key="${esc(a.key)}">
+          ${art(a.key, a.name, 'round', artistCoverId(a))}
+          <div class="meta"><div class="t">${esc(a.name)}</div><div class="s">${plural(a.ids.length, 'track')}</div></div>
+          <span class="chev">${icon('chevron-right')}</span>
+        </div>`).join('')
+      : emptyHTML(q ? 'Nothing found' : 'No artists yet', q ? 'Try a different search.' : 'Add the artist to your songs with ••• → Edit title & artist.');
+  } else if (state.view.name === 'artist') {
+    const a = artistIndex().get(state.view.key);
+    const ts = a ? a.ids.map((id) => state.tracks.get(id)).filter(Boolean) : [];
+    listIds = ts.map((t) => t.id);
+    el.innerHTML = ts.map((t, i) => rowHTML(t, i)).join('');
+  } else if (state.view.name === 'library') {
+    renderRecent();
     const ts = libraryTracks();
     listIds = ts.map((t) => t.id);
     el.innerHTML = ts.length
@@ -821,11 +925,15 @@ function renderPlayer() {
     ? upcoming.map((qid, i) => {
         const qt = state.tracks.get(qid);
         if (!qt) return '';
-        return `<div class="row" data-action="queue-play" data-pos="${player.index + 1 + i}">
+        const pos = player.index + 1 + i;
+        return `<div class="row" data-action="queue-play" data-pos="${pos}">
           ${art(qt.id, qt.title)}<div class="meta"><div class="t">${esc(qt.title)}</div><div class="s">${esc(qt.artist || fmtTime(qt.duration))}</div></div>
+          ${i > 0 ? `<button class="icon-btn more" data-action="queue-up" data-pos="${pos}" aria-label="Move up">${icon('up')}</button>` : ''}
+          <button class="icon-btn more" data-action="queue-remove" data-pos="${pos}" aria-label="Remove from queue">${icon('x')}</button>
         </div>`;
       }).join('')
     : '<p class="muted small">Nothing queued.</p>';
+  $('#queueClear').hidden = !upcoming.length;
   hydrateCovers($('#upnext'));
   renderTime();
 }
@@ -1177,9 +1285,43 @@ function bindEvents() {
         renderView();
         $('#view').scrollTop = 0;
         break;
-      case 'play-row': player.playList(listIds, Number(el.dataset.pos)); break;
-      case 'play-list': if (listIds.length) player.playList(listIds, 0, { shuffle: false }); break;
-      case 'shuffle-list': if (listIds.length) player.playList(listIds, Math.floor(Math.random() * listIds.length), { shuffle: true }); break;
+      case 'play-row': player.playList(listIds, Number(el.dataset.pos), { context: currentContext() }); break;
+      case 'play-list': if (listIds.length) player.playList(listIds, 0, { shuffle: false, context: currentContext() }); break;
+      case 'shuffle-list': if (listIds.length) player.playList(listIds, Math.floor(Math.random() * listIds.length), { shuffle: true, context: currentContext() }); break;
+      case 'lib-tab':
+        state.libTab = el.dataset.lib;
+        state.search = '';
+        renderView();
+        break;
+      case 'open-artist':
+        state.view = { name: 'artist', key: el.dataset.key };
+        renderView();
+        $('#view').scrollTop = 0;
+        break;
+      case 'back-artists':
+        state.view = { name: 'library' };
+        state.libTab = 'artists';
+        renderView();
+        break;
+      case 'open-recent': {
+        const { type, id } = el.dataset;
+        if (type === 'track') {
+          const ids = libraryTracks().map((t) => t.id);
+          const at = ids.indexOf(id);
+          player.playList(at >= 0 ? ids : [id], Math.max(0, at));
+        } else if (type === 'playlist') {
+          state.view = { name: 'playlist', id };
+          renderView();
+        } else if (type === 'artist') {
+          state.view = { name: 'artist', key: id };
+          renderView();
+        }
+        $('#view').scrollTop = 0;
+        break;
+      }
+      case 'queue-up': player.moveUp(Number(el.dataset.pos)); break;
+      case 'queue-remove': player.removeAt(Number(el.dataset.pos)); break;
+      case 'queue-clear': player.clearUpcoming(); break;
       case 'track-menu': trackMenu(el.dataset.id, el.dataset.index); break;
       case 'open-playlist':
         state.view = { name: 'playlist', id: el.dataset.id };
@@ -1263,7 +1405,23 @@ function bindEvents() {
   player.addEventListener('change', renderPlayer);
   player.audio.addEventListener('timeupdate', renderTime);
   player.audio.addEventListener('durationchange', renderTime);
-  player.audio.addEventListener('playing', () => { if (!player.isSilent && player.currentId) markPlayed(player.currentId); });
+  player.audio.addEventListener('playing', () => {
+    if (player.isSilent || !player.currentId) return;
+    markPlayed(player.currentId);
+    addRecent(player.context || { type: 'track', id: player.currentId });
+  });
+
+  // Remember what was playing (song, position, queue) so the app picks up where you left off.
+  let saveTimer;
+  const savePlayer = () => db.put('kv', player.snapshot(), 'playerState');
+  player.addEventListener('change', () => { clearTimeout(saveTimer); saveTimer = setTimeout(savePlayer, 400); });
+  let lastPosSave = 0;
+  player.audio.addEventListener('timeupdate', () => {
+    if (Date.now() - lastPosSave > 5000 && !player.isSilent) { lastPosSave = Date.now(); savePlayer(); }
+  });
+  player.audio.addEventListener('pause', savePlayer);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) savePlayer(); });
+  window.addEventListener('pagehide', savePlayer);
 
   document.addEventListener('visibilitychange', () => { if (!document.hidden) sync(); });
   window.addEventListener('online', () => sync());
@@ -1286,9 +1444,11 @@ function showMovedNotice() {
 async function init() {
   $$('[data-icon]').forEach((el) => { el.innerHTML = icon(el.dataset.icon) + el.innerHTML; });
 
-  const [tracks, blobKeys, playlists, settings, pending] = await Promise.all([
+  const [tracks, blobKeys, playlists, settings, pending, recent, playerState] = await Promise.all([
     db.all('tracks'), db.keys('blobs'), db.get('kv', 'playlists'), db.get('kv', 'settings'), db.get('kv', 'pending'),
+    db.get('kv', 'recent'), db.get('kv', 'playerState'),
   ]);
+  if (Array.isArray(recent)) state.recent = recent;
   tracks.forEach((t) => state.tracks.set(t.id, t));
   state.downloaded = new Set(blobKeys);
   if (playlists) state.playlists = playlists;
@@ -1309,6 +1469,12 @@ async function init() {
   bindEvents();
   render();
   showMovedNotice();
+
+  // Pick up where you left off (paused, at the same second).
+  if (playerState?.queue) {
+    const known = playerState.queue.every((id) => state.tracks.has(id));
+    if (known) player.restore(playerState);
+  }
 
   navigator.storage?.persist?.().catch(() => {});
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});

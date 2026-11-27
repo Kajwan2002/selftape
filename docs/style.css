@@ -322,3 +322,28 @@ body.has-mini .view { padding-bottom: calc(var(--tabs-h) + var(--mini-h) + var(-
 }
 .moved span { color: var(--muted); }
 .moved a { align-self: flex-start; text-decoration: none; }
+
+/* songs / artists switch */
+.seg { display: inline-flex; gap: 4px; padding: 3px; margin: 0 0 12px; border-radius: 999px; background: var(--surface); }
+.seg button { height: 32px; padding: 0 16px; border-radius: 999px; font-size: 14px; font-weight: 600; color: var(--muted); }
+.seg button.on { background: var(--surface-2); color: var(--text); }
+
+/* round artist pictures */
+.art.round { border-radius: 50%; }
+
+/* recently played */
+.section-title { margin: 2px 0 10px; font-size: 17px; }
+.recent-row {
+  display: flex; gap: 12px; overflow-x: auto; margin: 0 -16px 14px; padding: 0 16px 4px;
+  scroll-snap-type: x proximity; scrollbar-width: none;
+}
+.recent-row::-webkit-scrollbar { display: none; }
+.recent-item { flex: none; width: 104px; display: flex; flex-direction: column; gap: 3px; text-align: left; scroll-snap-align: start; }
+.recent-item .art { width: 104px; height: 104px; border-radius: 12px; font-size: 38px; }
+.recent-item .art.round { border-radius: 50%; }
+.recent-item .t { font-size: 13px; margin-top: 3px; }
+.recent-item .s { font-size: 12px; margin: 0; }
+
+/* up next */
+.upnext-head { display: flex; align-items: center; justify-content: space-between; }
+.upnext-head .pill { height: 30px; font-size: 14px; }

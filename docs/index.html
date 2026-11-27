@@ -72,7 +72,10 @@
         <button class="icon-btn" data-action="next" data-icon="next" aria-label="Next"></button>
         <button id="pRepeat" class="icon-btn side" data-action="repeat" aria-label="Repeat"></button>
       </div>
-      <div class="upnext"><h3>Up next</h3><div id="upnext" class="list compact"></div></div>
+      <div class="upnext">
+        <div class="upnext-head"><h3>Up next</h3><button id="queueClear" class="pill ghost" data-action="queue-clear" hidden>Clear</button></div>
+        <div id="upnext" class="list compact"></div>
+      </div>
     </div>
   </section>
 

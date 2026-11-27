@@ -36,6 +36,8 @@ class Player extends EventTarget {
     this.shuffle = false;
     this.repeat = 'off';  // off | all | one
     this.loadingId = null;
+    this.context = null;   // where playback started: { type: 'playlist'|'artist', ... } or null
+    this.resumeAt = null;  // { id, time } to jump to once that track loads (after an app restart)
     this.unlocked = false;
     this.url = null;
     this.token = 0;
@@ -102,9 +104,11 @@ class Player extends EventTarget {
   }
 
   // Must be called straight from a tap (before any await) so iOS allows playback.
-  playList(ids, start = 0, { shuffle } = {}) {
+  playList(ids, start = 0, { shuffle, context = null } = {}) {
     if (!ids.length) return;
     this.unlock();
+    this.context = context;
+    this.resumeAt = null;
     if (shuffle !== undefined) this.shuffle = shuffle;
     this.original = ids.slice();
     if (this.shuffle) {
@@ -118,7 +122,7 @@ class Player extends EventTarget {
     return this.load(this.index);
   }
 
-  async load(i, autoplay = true) {
+  async load(i, autoplay = true, quiet = false) {
     if (i < 0 || i >= this.queue.length) return;
     this.index = i;
     const id = this.queue[i];
@@ -133,7 +137,7 @@ class Player extends EventTarget {
       if (token !== this.token) return;
       this.loadingId = null;
       this.audio.pause();
-      this.hooks.onError(err);
+      if (!quiet) this.hooks.onError(err);
       this.emit();
       return;
     }
@@ -142,6 +146,11 @@ class Player extends EventTarget {
     if (this.url) URL.revokeObjectURL(this.url);
     this.url = URL.createObjectURL(blob);
     this.audio.src = this.url;
+    if (this.resumeAt?.id === id) {
+      const t = this.resumeAt.time;
+      this.resumeAt = null;
+      this.audio.addEventListener('loadedmetadata', () => { this.audio.currentTime = Math.min(t, (this.audio.duration || t + 1) - 1); this.emit(); }, { once: true });
+    }
     this.loadingId = null;
     this.updateMetadata();
     if (autoplay) {
@@ -159,6 +168,12 @@ class Player extends EventTarget {
 
   play() {
     if (this.currentId == null) return;
+    if (!this.unlocked && this.audio.src && !this.isSilent) {
+      // A track restored after an app restart: playing it from this tap unlocks audio too.
+      this.unlocked = true;
+      this.audio.play().catch(() => {});
+      return;
+    }
     this.unlock();
     if (this.isSilent || !this.audio.src) return this.load(this.index);
     this.audio.play().catch(() => {});
@@ -230,6 +245,52 @@ class Player extends EventTarget {
     this.queue.push(id);
     this.original.push(id);
     this.emit();
+  }
+
+  // ----- queue editing ("Up next") -----
+  removeAt(pos) {
+    if (pos <= this.index || pos >= this.queue.length) return;
+    const [id] = this.queue.splice(pos, 1);
+    if (this.shuffle) { const at = this.original.indexOf(id); if (at >= 0) this.original.splice(at, 1); }
+    else this.original = this.queue.slice();
+    this.emit();
+    this.prefetch();
+  }
+
+  moveUp(pos) {
+    if (pos <= this.index + 1 || pos >= this.queue.length) return;
+    [this.queue[pos - 1], this.queue[pos]] = [this.queue[pos], this.queue[pos - 1]];
+    if (!this.shuffle) this.original = this.queue.slice();
+    this.emit();
+    this.prefetch();
+  }
+
+  clearUpcoming() {
+    this.queue = this.queue.slice(0, this.index + 1);
+    this.original = this.queue.slice();
+    this.emit();
+  }
+
+  // ----- remembering where you were -----
+  snapshot() {
+    if (this.currentId == null) return null;
+    return {
+      queue: this.queue, original: this.original, index: this.index,
+      shuffle: this.shuffle, repeat: this.repeat, context: this.context,
+      time: this.isSilent ? (this.resumeAt?.time || 0) : this.audio.currentTime || 0,
+    };
+  }
+
+  restore(s) {
+    if (!s?.queue?.length || s.index < 0 || s.index >= s.queue.length) return;
+    this.queue = s.queue;
+    this.original = s.original?.length ? s.original : s.queue.slice();
+    this.index = s.index;
+    this.shuffle = !!s.shuffle;
+    this.repeat = s.repeat || 'off';
+    this.context = s.context || null;
+    this.resumeAt = { id: this.queue[this.index], time: s.time || 0 };
+    this.load(this.index, false, true); // paused, ready to continue
   }
 
   removeTrack(id) {
