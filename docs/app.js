@@ -3,6 +3,8 @@ import * as api from './api.js';
 import { player } from './player.js';
 import { icon } from './icons.js';
 
+const APP_VERSION = 'v4'; // keep in sync with VERSION in sw.js
+
 // ---------- helpers ----------
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
@@ -413,7 +415,8 @@ function settingsHTML() {
     <section class="card">
       <h3>Install on iPhone</h3>
       <p class="muted small">Open this page in Safari, tap the Share button, then <b>Add to Home Screen</b>. It opens full-screen like a normal app and works offline.</p>
-    </section>`;
+    </section>
+    <p class="muted small" style="text-align:center">Selftape ${APP_VERSION}</p>`;
 }
 
 const emptyHTML = (title, sub) => `<div class="empty"><div class="t">${esc(title)}</div><div class="s wrap">${sub}</div></div>`;

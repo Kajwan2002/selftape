@@ -43,7 +43,17 @@ class Player extends EventTarget {
 
     const a = this.audio;
     a.addEventListener('ended', () => { if (!this.isSilent) this.next(true); });
-    a.addEventListener('play', () => { if (!this.isSilent) this.bindMediaSession(); this.emit(); });
+    a.addEventListener('play', () => this.emit());
+    // iOS only keeps lock-screen buttons that are registered once a track is
+    // really "now playing", and forgets them when a new track starts. So
+    // register on every 'playing' event, once more a moment later, and when the
+    // app comes back to the foreground.
+    a.addEventListener('playing', () => {
+      if (this.isSilent) return;
+      this.bindMediaSession();
+      setTimeout(() => { if (this.playing) this.bindMediaSession(); }, 500);
+    });
+    document.addEventListener('visibilitychange', () => { if (this.playing) this.bindMediaSession(); });
     a.addEventListener('pause', () => this.emit());
     a.addEventListener('loadedmetadata', () => {
       const id = this.currentId;
@@ -67,13 +77,14 @@ class Player extends EventTarget {
     const ms = navigator.mediaSession;
     if (!ms) return;
     const set = (action, fn) => { try { ms.setActionHandler(action, fn); } catch {} };
-    set('seekbackward', null);
-    set('seekforward', null);
     set('play', () => this.play());
     set('pause', () => this.audio.pause());
     set('previoustrack', () => this.prev());
     set('nexttrack', () => this.next());
     set('seekto', (d) => this.seek(d.seekTime));
+    // Clear these last so iOS falls back to the previous/next track buttons.
+    set('seekbackward', null);
+    set('seekforward', null);
   }
 
   init(hooks) { Object.assign(this.hooks, hooks); }
