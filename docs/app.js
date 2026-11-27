@@ -3,7 +3,7 @@ import * as api from './api.js';
 import { player } from './player.js';
 import { icon } from './icons.js';
 
-const APP_VERSION = 'v17'; // keep in sync with VERSION in sw.js
+const APP_VERSION = 'v18'; // keep in sync with VERSION in sw.js
 
 // ---------- helpers ----------
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -1248,6 +1248,86 @@ async function saveMix(mx) {
   renderView();
 }
 
+// ---------- song info: check & fix the whole library ----------
+const missingGenre = (t) => !t.genre;
+const missingCover = (t) => !t.cover;
+
+function songInfoCard() {
+  const all = [...state.tracks.values()];
+  const noGenre = all.filter(missingGenre).length;
+  const noCover = all.filter(missingCover).length;
+  const fixed = all.filter((t) => t.origTitle).length;
+  const ok = all.length - all.filter((t) => missingGenre(t) || missingCover(t)).length;
+  return `
+    <section class="card">
+      <h3>Song info</h3>
+      <div class="stats">
+        <div><b>${ok}</b><span>complete</span></div>
+        <div class="${noGenre ? 'warn' : ''}"><b>${noGenre}</b><span>no genre</span></div>
+        <div class="${noCover ? 'warn' : ''}"><b>${noCover}</b><span>no cover</span></div>
+        <div><b>${fixed}</b><span>names fixed</span></div>
+      </div>
+      <p class="muted small">Looks every song up again: fills in missing genres and covers, and fixes messy titles and artists (swapped, typos, “official video”…). Names you edited yourself are never changed.</p>
+      <div class="row-btns">
+        <button class="pill primary" data-action="fix-all">${icon('sync')} Check & fix all songs</button>
+        ${noGenre || noCover ? `<button class="pill" data-action="missing-info">See songs missing info</button>` : ''}
+      </div>
+    </section>`;
+}
+
+let fixingAll = false;
+async function fixAllSongs() {
+  if (fixingAll || !configured()) return;
+  fixingAll = true;
+  const total = state.tracks.size;
+  const report = { renamed: [], genres: 0, covers: 0, retry: 0 };
+  try {
+    let after = '';
+    let checked = 0;
+    for (let i = 0; i < 400; i++) {
+      toast(`Checking songs… ${Math.min(checked, total)} / ${total}`);
+      const r = await api.fixLibrary(state.settings, after, true);
+      report.renamed.push(...r.renamed);
+      report.genres += r.genres;
+      report.covers += r.covers;
+      report.retry += r.retry;
+      checked += 5;
+      after = r.after;
+      if (r.done) break;
+    }
+    await sync();
+    const lines = [
+      `${plural(report.renamed.length, 'name')} fixed · ${plural(report.genres, 'genre')} · ${plural(report.covers, 'cover')} found`,
+      ...(report.retry ? [`${plural(report.retry, 'song')} couldn’t be checked (music search busy) — try again later`] : []),
+    ];
+    await menu('Done checking', [
+      ...report.renamed.slice(0, 30).map((r) => ({ key: `r:${r.id}`, label: `${r.from}  →  ${r.to}`, icon: 'edit' })),
+      ...(state.tracks.size && [...state.tracks.values()].some((t) => missingGenre(t) || missingCover(t))
+        ? [{ key: 'missing', label: 'See songs still missing info', icon: 'search' }] : []),
+    ], lines.join('\n')).then((k) => { if (k === 'missing') showMissingInfo(); });
+  } catch (err) {
+    toast(err.message);
+  } finally {
+    fixingAll = false;
+    if (state.view.name === 'settings') renderView();
+  }
+}
+
+// A list of songs without a genre or cover; tap one to fix it.
+async function showMissingInfo() {
+  const list = [...state.tracks.values()].filter((t) => missingGenre(t) || missingCover(t))
+    .sort((a, b) => a.title.localeCompare(b.title, undefined, { sensitivity: 'base' }));
+  if (!list.length) return toast('Every song has a genre and a cover 🎉');
+  const key = await menu(`${plural(list.length, 'song')} missing info`,
+    list.map((t) => ({
+      key: t.id,
+      label: `${t.title}${t.artist ? ` · ${t.artist}` : ''} — ${[missingGenre(t) && 'no genre', missingCover(t) && 'no cover'].filter(Boolean).join(', ')}`,
+      icon: 'edit',
+    })),
+    'Tap a song to edit it, set a genre, or pick a cover.');
+  if (key) trackMenu(key, '');
+}
+
 // ---------- recently played ----------
 function addRecent(item) {
   state.recent = [{ ...item, at: Date.now() }, ...state.recent.filter((r) => !(r.type === item.type && r.id === item.id))].slice(0, 12);
@@ -1355,10 +1435,10 @@ function settingsHTML() {
       <div class="row-btns">
         <button class="pill" data-action="import">${icon('file')} Import from Files</button>
         ${configured() ? `<button class="pill" data-action="download-all">${icon('download')} Download all</button>
-        <button class="pill" data-action="remove-downloads">Free up space</button>
-        <button class="pill" data-action="find-covers">${icon('search')} Find missing covers</button>` : ''}
+        <button class="pill" data-action="remove-downloads">Free up space</button>` : ''}
       </div>
     </section>
+    ${configured() ? songInfoCard() : ''}
     <section class="card">
       <h3>Install on iPhone</h3>
       <p class="muted small">Open this page in Safari, tap the Share button, then <b>Add to Home Screen</b>. It opens full-screen like a normal app and works offline.</p>
@@ -1685,6 +1765,7 @@ async function trackMenu(id, index) {
     { key: 'queue', label: 'Add to queue', icon: 'queue' },
     { key: 'add', label: 'Add to playlist…', icon: 'playlists' },
     { key: 'edit', label: 'Edit title & artist', icon: 'edit' },
+    ...(t.origTitle && configured() ? [{ key: 'restore', label: `Restore original name (“${t.origTitle}”)`, icon: 'x' }] : []),
   ];
   if (configured() && cloudCopy(id)) {
     items.push({ key: 'cover-pick', label: t.cover ? 'Change cover…' : 'Find cover art…', icon: 'search' });
@@ -1705,6 +1786,16 @@ async function trackMenu(id, index) {
     case 'queue': player.addToQueue(id); toast('Added to queue'); break;
     case 'add': await addToPlaylist(id); break;
     case 'edit': await editTrack(t); break;
+    case 'restore':
+      try {
+        const st = await api.restoreName(state.settings, id);
+        Object.assign(t, { title: st.title, artist: st.artist, origTitle: '', origArtist: '' });
+        await db.put('tracks', t);
+        renderView();
+        renderPlayer();
+        toast('Original name restored');
+      } catch (err) { toast(err.message); }
+      break;
     case 'cover-pick': {
       const url = await coverPicker(t);
       if (!url) break;
@@ -1975,6 +2066,8 @@ function bindEvents() {
       case 'download-all': toast('Downloading…'); backgroundDownload(true); break;
       case 'remove-downloads': removeDownloads(); break;
       case 'find-covers': findMissingCovers(); break;
+      case 'fix-all': fixAllSongs(); break;
+      case 'missing-info': showMissingInfo(); break;
       case 'open-player': openPlayer(); break;
       case 'close-player': closePlayer(); break;
       case 'toggle': player.toggle(); break;

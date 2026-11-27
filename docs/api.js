@@ -54,6 +54,11 @@ export const saveFeatures = (s, id, features) => call(s, `/tracks/${id}`, { meth
 
 export const lookupTrack = async (s, id) => (await call(s, `/tracks/${id}/lookup`, { method: 'POST' })).json();
 
+export const fixLibrary = async (s, after, rename = true) =>
+  (await call(s, '/library/fix', { method: 'POST', ...jsonBody({ after, rename }) })).json();
+
+export const restoreName = async (s, id) => (await call(s, `/tracks/${id}`, { method: 'PATCH', ...jsonBody({ restore: true }) })).json();
+
 export const findMissingGenres = async (s) => (await call(s, '/genres/find-missing', { method: 'POST' })).json();
 
 export const deleteTrack = (s, id) => call(s, `/tracks/${id}`, { method: 'DELETE' });

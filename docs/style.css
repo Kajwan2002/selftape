@@ -379,3 +379,11 @@ body.has-mini .view { padding-bottom: calc(var(--tabs-h) + var(--mini-h) + var(-
   .recent-row.dragging { cursor: grabbing; scroll-snap-type: none; }
   .recent-row.dragging * { pointer-events: none; }
 }
+
+/* song info stats */
+.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 4px 0 6px; }
+.stats > div { background: var(--surface-2); border-radius: 12px; padding: 10px 6px; text-align: center; display: flex; flex-direction: column; gap: 2px; }
+.stats b { font-size: 20px; }
+.stats span { font-size: 11px; color: var(--muted); }
+.stats .warn b { color: var(--accent); }
+.sheet-head .s { white-space: pre-line; }

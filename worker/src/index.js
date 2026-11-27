@@ -52,6 +52,7 @@ async function route(request, env, ctx, url) {
   if (pathname === '/telegram/setup' && method === 'POST') return setupTelegram(env, url);
   if (pathname === '/covers/find-missing' && method === 'POST') return findMissingCovers(env);
   if (pathname === '/genres/find-missing' && method === 'POST') return findMissingGenres(env);
+  if (pathname === '/library/fix' && method === 'POST') return fixLibrary(request, env);
   if (pathname === '/artist-photos/find' && method === 'POST') return findArtistPhotos(request, env);
   if (pathname === '/artist-photo' && method === 'GET') return getArtistPhoto(url, env);
   if (pathname === '/artist-photo' && method === 'PUT') return setArtistPhoto(request, env);
@@ -95,7 +96,8 @@ async function ensureSchema(env) {
     env.DB.prepare('CREATE TABLE IF NOT EXISTS plays (track_id TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (track_id, at))'),
   ]);
   // Columns added after the first release (ignore "duplicate column" errors).
-  for (const col of ['cover_file_id TEXT', 'cover_url TEXT', 'cover_checked INTEGER', 'genre TEXT', 'genre_checked INTEGER', 'features TEXT']) {
+  for (const col of ['cover_file_id TEXT', 'cover_url TEXT', 'cover_checked INTEGER', 'genre TEXT', 'genre_checked INTEGER', 'features TEXT',
+    'orig_title TEXT', 'orig_artist TEXT', 'name_locked INTEGER', 'fix_checked INTEGER']) {
     try { await env.DB.prepare(`ALTER TABLE tracks ADD COLUMN ${col}`).run(); } catch {}
   }
   schemaReady = true;
@@ -130,6 +132,8 @@ const toTrack = (r) => ({
   cover: coverKey(r),
   genre: r.genre || '',
   features: parseFeatures(r.features),
+  origTitle: r.orig_title || '',
+  origArtist: r.orig_artist ?? '',
 });
 
 function parseFeatures(f) {
@@ -271,14 +275,9 @@ async function uploadTrack(request, env) {
     chatId: target, messageId: msg.message_id,
     coverFileId: file.thumbnail?.file_id || null,
   };
-  const match = await lookupMatch(artist, title).catch(() => null);
-  track.genre = match?.genre || null;
-  if (!track.coverFileId) {
-    track.coverUrl = match?.art || null;
-    track.coverChecked = true;
-  }
   await insertTrack(env, track);
-  return json(toTrack({ ...track, added_at: track.addedAt }));
+  const fixed = await fixTrack(env, await getRow(env, id), { rename: true });
+  return json(toTrack(fixed.row));
 }
 
 async function getAudio(id, env) {
@@ -297,6 +296,16 @@ async function updateTrack(id, request, env) {
   const body = await request.json().catch(() => ({}));
   const row = await getRow(env, id);
   if (!row) return json({ error: 'Not found' }, 404);
+  if (body.restore && row.orig_title) {
+    // undo an automatic name fix
+    await env.DB.prepare('UPDATE tracks SET title = ?, artist = ?, orig_title = NULL, orig_artist = NULL, name_locked = 1 WHERE id = ?')
+      .bind(row.orig_title, row.orig_artist || '', id).run();
+    return json(toTrack(await getRow(env, id)));
+  }
+  if (body.title !== undefined || body.artist !== undefined) {
+    // you edited the name yourself: never rename this song automatically again
+    await env.DB.prepare('UPDATE tracks SET name_locked = 1 WHERE id = ?').bind(id).run();
+  }
   const title = clean(body.title) || row.title;
   const artist = body.artist !== undefined ? clean(body.artist, 60) : row.artist;
   const duration = !row.duration && Number(body.duration) ? Number(body.duration) : row.duration;
@@ -363,12 +372,55 @@ async function findMissingCovers(env) {
 async function lookupOne(id, env) {
   const row = await getRow(env, id);
   if (!row) return json({ error: 'Not found' }, 404);
-  const m = await lookupMatch(row.artist, row.title).catch(() => null);
-  const genre = row.genre || m?.genre || null;
-  const coverUrl = !row.cover_file_id && !row.cover_url && m?.art ? m.art : row.cover_url;
-  await env.DB.prepare('UPDATE tracks SET genre = ?, genre_checked = ?, cover_url = ?, cover_checked = 1 WHERE id = ?')
-    .bind(genre, m?.retry ? null : 1, coverUrl, id).run();
-  return json({ track: toTrack({ ...row, genre, cover_url: coverUrl }), matched: !!m?.art, retry: !!m?.retry });
+  const r = await fixTrack(env, row, { rename: true });
+  return json({ track: toTrack(r.row), matched: r.matched, retry: r.retry, renamed: r.renamed });
+}
+
+// Look a song up and fill in what's missing: genre, cover, and (if it's not a
+// name you typed yourself) the official title + artist. Returns what changed.
+async function fixTrack(env, row, { rename = true } = {}) {
+  const m = await lookupMatch(row.artist, row.title).catch(() => ({ retry: true }));
+  const out = { row: { ...row }, matched: !!m?.art, retry: !!m?.retry, renamed: null, gotGenre: false, gotCover: false };
+  const r = out.row;
+  if (m?.title && rename && !row.name_locked
+      && (norm(m.title) !== norm(row.title) || norm(m.artist) !== norm(row.artist))) {
+    out.renamed = { from: `${row.title}${row.artist ? ` · ${row.artist}` : ''}`, to: `${m.title} · ${m.artist}` };
+    r.orig_title = row.orig_title || row.title;
+    r.orig_artist = row.orig_title ? row.orig_artist : row.artist || '';
+    r.title = clean(m.title) || row.title;
+    r.artist = clean(m.artist, 60);
+  }
+  if (!r.genre && m?.genre) { r.genre = m.genre; out.gotGenre = true; }
+  if (!r.cover_file_id && !r.cover_url && m?.art) { r.cover_url = m.art; out.gotCover = true; }
+  await env.DB.prepare(`UPDATE tracks SET title = ?, artist = ?, orig_title = ?, orig_artist = ?, genre = ?, cover_url = ?,
+      cover_checked = 1, genre_checked = ?, fix_checked = ? WHERE id = ?`)
+    .bind(r.title, r.artist || '', r.orig_title || null, r.orig_title ? r.orig_artist || '' : null, r.genre || null, r.cover_url || null,
+      out.retry ? null : 1,
+      // only count the name as checked when this pass was allowed to fix names
+      rename ? (out.retry ? null : 1) : row.fix_checked ?? null,
+      row.id).run();
+  return out;
+}
+
+// "Check & fix all songs": goes through the library a few songs at a time
+// (the app keeps calling with `after` until done).
+async function fixLibrary(request, env) {
+  const body = await request.json().catch(() => ({}));
+  const after = String(body.after || '');
+  const rename = body.rename !== false;
+  const { results } = await env.DB.prepare('SELECT * FROM tracks WHERE id > ? ORDER BY id LIMIT 5').bind(after).all();
+  const report = { renamed: [], genres: 0, covers: 0, retry: 0 };
+  for (const row of results) {
+    const needs = !row.genre || (!row.cover_file_id && !row.cover_url) || (rename && !row.fix_checked && !row.name_locked);
+    if (!needs) continue;
+    const r = await fixTrack(env, row, { rename });
+    if (r.renamed) report.renamed.push({ id: row.id, ...r.renamed });
+    if (r.gotGenre) report.genres++;
+    if (r.gotCover) report.covers++;
+    if (r.retry) report.retry++;
+  }
+  const last = results[results.length - 1]?.id || after;
+  return json({ after: last, done: results.length < 5, ...report });
 }
 
 async function findMissingGenres(env) {
@@ -377,10 +429,10 @@ async function findMissingGenres(env) {
   const { results } = await env.DB.prepare(`SELECT id, title, artist FROM tracks WHERE ${where} LIMIT 6`).all();
   let found = 0;
   for (const r of results) {
-    const m = await lookupMatch(r.artist, r.title).catch(() => ({ retry: true }));
-    if (m?.genre) found++;
-    if (m?.retry) { retry++; continue; } // Apple said "too many requests": try this one again later
-    await env.DB.prepare('UPDATE tracks SET genre = COALESCE(genre, ?), genre_checked = 1 WHERE id = ?').bind(m?.genre || null, r.id).run();
+    const full = await getRow(env, r.id);
+    const res = await fixTrack(env, full, { rename: false });
+    if (res.gotGenre) found++;
+    if (res.retry) retry++; // Apple said "too many requests": it stays unchecked and is tried again later
   }
   const left = await env.DB.prepare(`SELECT COUNT(*) AS n FROM tracks WHERE ${where}`).first();
   return json({ checked: results.length, found, retry, remaining: left.n });
@@ -493,7 +545,8 @@ async function searchCatalog(query, limit = 25, { itunes = true, deezer = true, 
   if (itunes) {
     jobs.push(fetch(`https://itunes.apple.com/search?entity=song&limit=${limit}&term=${encodeURIComponent(query)}`)
       .then((r) => { if (!r.ok) status.itunesFailed = true; return r.ok ? r.json() : { results: [] }; })
-      .then((d) => (d.results || []).filter((r) => r.artworkUrl100).map((r) => ({
+      .then((d) => (d.results || []).filter((r) => r.artworkUrl100).map((r, rank) => ({
+        src: 'apple', rank,
         title: r.trackName, artist: r.artistName, album: r.collectionName,
         art: r.artworkUrl100.replace(/\/\d+x\d+bb\./, '/600x600bb.'),
         genre: r.primaryGenreName || '',
@@ -503,7 +556,8 @@ async function searchCatalog(query, limit = 25, { itunes = true, deezer = true, 
   if (deezer) {
     jobs.push(fetch(`https://api.deezer.com/search?limit=${Math.min(limit, 50)}&q=${encodeURIComponent(query)}`)
       .then((r) => (r.ok ? r.json() : { data: [] }))
-      .then((d) => (d.data || []).filter((r) => r.album?.cover_xl).map((r) => ({
+      .then((d) => (d.data || []).filter((r) => r.album?.cover_xl).map((r, rank) => ({
+        src: 'deezer', rank,
         title: r.title, artist: r.artist?.name || '', album: r.album?.title || '', art: r.album.cover_xl,
         deezerAlbum: r.album?.id,
       })))
@@ -520,63 +574,81 @@ async function lookupCover(artist, title) {
   return (await lookupMatch(artist, title))?.art || null; // null when nothing matched
 }
 
+// Smart lookup: compares *words*, not exact strings, so it copes with typos,
+// swapped title/artist, a missing artist, and junk like "official video" or
+// track numbers. It still says "no idea" when results are unrelated (e.g. your
+// own unreleased songs). Returns { title, artist, art, genre } or null.
+const STOP_WORDS = new Set(['the', 'a', 'an', 'and', 'feat', 'ft', 'featuring', 'official', 'audio', 'video', 'music', 'lyrics',
+  'lyric', 'hd', 'hq', 'mp3', 'remastered', 'remaster', 'version', 'original', 'full', 'song', 'by', 'prod', 'visualizer']);
+const matchWords = (s) => norm(s).split(' ').filter((w) => w && !STOP_WORDS.has(w) && !/^\d{1,2}$/.test(w));
+const VERSION_WORDS = /\b(remix|mix|live|acoustic|instrumental|karaoke|sped up|slowed|reverb|cover|version|edit|demo|tribute)\b/i;
+const cleanTitle = (t) => String(t || '')
+  .replace(/\s*[-–]\s*(\d{4}\s+)?remaster(ed)?(\s+\d{4})?(\s+version)?\s*$/i, '')
+  .replace(/\s*[([](\d{4}\s+)?remaster(ed)?[^)\]]*[)\]]/i, '')
+  .trim();
+
 async function lookupMatch(artist, title) {
-  let a = artist;
-  let t = title;
-  if (!a && / - /.test(t)) [a, t] = t.split(/ - (.*)/s); // "Artist - Song" titles
-  const na = norm(a);
-  const nt = norm(t);
-  if (!na || !nt) return null;
+  const query = `${artist || ''} ${title || ''}`.trim();
+  const q = matchWords(query);
+  if (!q.length) return null;
+  const wantsVersion = VERSION_WORDS.test(query);
 
-  // Versions we skip unless the title asks for them (so "Song" doesn't get the remix cover).
-  const VERSION_WORDS = /\b(remix|mix|live|acoustic|instrumental|karaoke|sped up|slowed|reverb|cover|version|edit|demo)\b/;
-  const wantsVersion = VERSION_WORDS.test(String(title || '').toLowerCase());
-
-  const artistScore = (x) => {
-    const n = norm(x);
-    if (!n) return 0;
-    if (n === na || n.includes(na) || na.includes(n)) return 1;
-    return similarity(n, na);
-  };
-  const titleScore = (x) => {
-    const n = norm(x);
-    if (!n) return 0;
-    if (n === nt) return 1;
-    if (n.startsWith(nt + ' ') || nt.startsWith(n + ' ')) return 0.9;
-    return similarity(n, nt);
-  };
-  const score = (c) => {
-    if (!wantsVersion && VERSION_WORDS.test(String(c.title || '').toLowerCase())) return 0;
-    const as = artistScore(c.artist);
-    const ts = titleScore(c.title);
-    return as >= 0.75 && ts >= 0.8 ? as + ts * 2 : 0; // title counts double
+  const evaluate = (c) => {
+    if (!wantsVersion && VERSION_WORDS.test(String(c.title || ''))) return null;
+    const tw = matchWords(c.title);
+    const aw = matchWords(c.artist);
+    if (!tw.length) return null;
+    const used = new Set();
+    const hit = (w) => {
+      const j = q.findIndex((x, i) => !used.has(i) && (x === w || (x.length >= 3 && w.length >= 3 && similarity(x, w) >= (Math.min(x.length, w.length) <= 4 ? 0.75 : 0.8))));
+      if (j >= 0) { used.add(j); return true; }
+      return false;
+    };
+    const titleCov = tw.filter(hit).length / tw.length;
+    const artistCov = aw.length ? aw.filter(hit).length / aw.length : 0;
+    const queryCov = used.size / q.length;
+    return { c, titleCov, artistCov, queryCov, score: titleCov * 2 + artistCov + queryCov - c.rank * 0.02 };
   };
 
-  // First the exact words on both catalogues. Only if that finds nothing, also
-  // search the artist's catalogue (misspelled titles) and the title alone
-  // (misspelled artist). Fewer requests = less chance Apple says "too many".
   const status = {};
-  const candidates = await searchCatalog(`${a} ${t}`, 25, { status });
-  const pickBest = (list) => {
-    let best = null;
-    let bestScore = 0;
-    for (const c of list) { const sc = score(c); if (sc > bestScore) { best = c; bestScore = sc; } }
-    return best;
+  let cands = await searchCatalog(query, 15, { status });
+  const pick = (list) => {
+    const rated = list.map(evaluate).filter(Boolean);
+    // 1) title and artist both there (any order, small typos OK)
+    const full = rated.filter((r) => r.titleCov >= 0.75 && r.artistCov >= 0.5 && r.queryCov >= 0.6);
+    if (full.length) return full.sort((a, b) => b.score - a.score)[0];
+    // 2) only a title (no or wrong artist): Apple and Deezer must agree on the same song near the top,
+    //    or the title must be long and specific (4+ words)
+    const titleOnly = rated.filter((r) => r.titleCov === 1 && r.queryCov >= 0.8 && r.c.rank <= 2);
+    for (const r of titleOnly.sort((a, b) => b.score - a.score)) {
+      const t = norm(r.c.title);
+      const a = norm(r.c.artist);
+      const agree = titleOnly.some((o) => o.c.src !== r.c.src && norm(o.c.title) === t && (norm(o.c.artist).includes(a) || a.includes(norm(o.c.artist))));
+      if (agree || matchWords(r.c.title).length >= 4) return r;
+    }
+    return null;
   };
-  let best = pickBest(candidates);
-  if (!best) {
-    const more = await Promise.all([
-      searchCatalog(a, 200, { deezer: false, status }),
-      searchCatalog(t, 50, { deezer: false, status }),
-    ]);
-    candidates.push(...more.flat());
-    best = pickBest(candidates);
+  let best = pick(cands);
+  if (!best && artist) {
+    // maybe the "artist" is wrong or is really part of the title: try the title alone
+    const more = await searchCatalog(title, 15, { status });
+    cands = cands.concat(more);
+    best = pick(more);
+  }
+  if (!best && artist && title) {
+    // typos in the title: look through the artist's own songs
+    const byArtist = await searchCatalog(artist, 50, { status });
+    cands = cands.concat(byArtist);
+    best = pick(byArtist);
   }
   if (!best) return status.itunesFailed ? { art: null, genre: '', retry: true } : null;
-  // Genre: from an Apple Music result for the same song, else from the Deezer album.
-  let genre = best.genre || candidates.find((c) => c.genre && score(c) > 0)?.genre || '';
+
+  const b = best.c;
+  const same = (c) => norm(cleanTitle(c.title)) === norm(cleanTitle(b.title)) && norm(c.artist) === norm(b.artist)
+    && (wantsVersion || !VERSION_WORDS.test(String(c.title || '')));
+  let genre = b.genre || cands.find((c) => c.genre && same(c))?.genre || '';
   if (!genre) {
-    const albumId = best.deezerAlbum || candidates.find((c) => c.deezerAlbum && score(c) > 0)?.deezerAlbum;
+    const albumId = b.deezerAlbum || cands.find((c) => c.deezerAlbum && same(c))?.deezerAlbum;
     if (albumId) {
       genre = await fetch(`https://api.deezer.com/album/${albumId}`)
         .then((r) => (r.ok ? r.json() : {}))
@@ -584,7 +656,9 @@ async function lookupMatch(artist, title) {
         .catch(() => '');
     }
   }
-  return { art: best.art, genre, retry: !genre && status.itunesFailed };
+  // prefer Apple's spelling/cover when both catalogues have the song
+  const apple = b.src === 'apple' ? b : cands.find((c) => c.src === 'apple' && same(c));
+  return { title: cleanTitle((apple || b).title), artist: (apple || b).artist, art: (apple || b).art, genre, retry: !genre && status.itunesFailed };
 }
 
 function norm(s) {
@@ -696,7 +770,10 @@ async function handleMessage(msg, env) {
       return reply(env, chatId, "Send or forward me an audio file and I'll add it to Selftape. I use the song's own title and artist; a caption is only used if the file has no title.");
     }
     if (result.duplicate) return reply(env, chatId, `Already in Selftape: “${result.title}”`, msg.message_id);
-    return reply(env, chatId, `✅ Added “${result.title}”`, msg.message_id);
+    const who = result.artist ? ` · ${result.artist}` : '';
+    const note = result.renamed ? `\n✏️ Fixed the name (was “${result.renamed.from}”)` : '';
+    const genre = result.genre ? `\n🏷️ ${result.genre}` : '';
+    return reply(env, chatId, `✅ Added “${result.title}”${who}${genre}${note}`, msg.message_id);
   } catch (err) {
     return reply(env, chatId, `⚠️ ${err.message}`, msg.message_id);
   }
@@ -777,17 +854,16 @@ async function addFromMessage(env, msg, cfg, { source, archive }) {
 
   const artist = clean(file.performer, 60);
   const coverFileId = file.thumbnail?.file_id || file.thumb?.file_id || null;
-  const match = await lookupMatch(artist, title).catch(() => null);
-  const coverUrl = coverFileId ? null : match?.art || null;
 
+  const newId = crypto.randomUUID();
   await insertTrack(env, {
-    id: crypto.randomUUID(),
+    id: newId,
     title,
     artist,
     coverFileId,
-    coverUrl,
-    coverChecked: true,
-    genre: match?.genre || null,
+    coverUrl: null,
+    coverChecked: false,
+    genre: null,
     duration: file.duration || 0,
     size: file.file_size || 0,
     type,
@@ -798,7 +874,8 @@ async function addFromMessage(env, msg, cfg, { source, archive }) {
     chatId,
     messageId,
   });
-  return { title };
+  const fixed = await fixTrack(env, await getRow(env, newId), { rename: true });
+  return { title: fixed.row.title, artist: fixed.row.artist, renamed: fixed.renamed, genre: fixed.row.genre };
 }
 
 function pickAudio(msg) {
