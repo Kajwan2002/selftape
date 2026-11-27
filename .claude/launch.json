@@ -1,0 +1,6 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    { "name": "api", "runtimeExecutable": "npx", "runtimeArgs": ["--prefix", "worker", "wrangler", "dev", "--cwd", "worker", "--port", "8787", "--var", "ALLOWED_ORIGIN:*"], "port": 8787 }
+  ]
+}

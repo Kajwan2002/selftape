@@ -1,14 +1,14 @@
-// Selftape API — a Cloudflare Worker that stores your music in R2,
-// syncs playlists between devices, and runs your private Telegram bot.
+// Selftape API — a Cloudflare Worker.
+// Audio files live in Telegram (your "my music" channel), the track list and
+// playlists live in a free Cloudflare D1 database, and it runs your private bot.
 //
 // Secrets (set with `npx wrangler secret put NAME`):
 //   APP_TOKEN  – the password the app uses to talk to this server
 //   BOT_TOKEN  – your Telegram bot token from @BotFather
-// Optional:
-//   ALLOWED_ORIGIN  – lock the API to your GitHub Pages origin (default "*")
-//   ALLOWED_USER_ID – extra Telegram user IDs allowed to use the bot (comma separated)
+// Vars (wrangler.toml):
+//   ALLOWED_ORIGIN – your GitHub Pages origin (default "*")
 
-const MAX_BOT_BYTES = 20 * 1024 * 1024; // Telegram's limit for bot downloads
+const MAX_TG_BYTES = 20 * 1024 * 1024; // Telegram bots can only download files up to 20 MB
 const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const AUDIO_EXT = /\.(mp3|m4a|mp4|aac|wav|wave|aif|aiff|flac|alac|caf|ogg|oga|opus|webm)$/i;
 const MIME_BY_EXT = {
@@ -16,6 +16,7 @@ const MIME_BY_EXT = {
   wave: 'audio/wav', aif: 'audio/aiff', aiff: 'audio/aiff', flac: 'audio/flac', alac: 'audio/mp4',
   caf: 'audio/x-caf', ogg: 'audio/ogg', oga: 'audio/ogg', opus: 'audio/ogg', webm: 'audio/webm',
 };
+const EXT_BY_MIME = { 'audio/mpeg': 'mp3', 'audio/mp4': 'm4a', 'audio/x-m4a': 'm4a', 'audio/aac': 'aac', 'audio/wav': 'wav', 'audio/x-wav': 'wav', 'audio/aiff': 'aiff', 'audio/flac': 'flac', 'audio/ogg': 'ogg', 'audio/webm': 'webm', 'audio/x-caf': 'caf' };
 
 export default {
   async fetch(request, env, ctx) {
@@ -23,10 +24,11 @@ export default {
     if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors });
     let res;
     try {
+      await ensureSchema(env);
       res = await route(request, env, ctx, new URL(request.url));
     } catch (err) {
       console.error(err);
-      res = json({ error: err.message || 'Server error' }, 500);
+      res = json({ error: err.message || 'Server error' }, err.status || 500);
     }
     res = new Response(res.body, res); // make headers mutable
     for (const [k, v] of Object.entries(cors)) res.headers.set(k, v);
@@ -56,29 +58,75 @@ async function route(request, env, ctx, url) {
     if (parts.length === 3 && parts[2] === 'audio' && method === 'GET') return getAudio(id, env);
     if (parts.length === 2 && method === 'PATCH') return updateTrack(id, request, env);
     if (parts.length === 2 && method === 'DELETE') {
-      await env.BUCKET.delete(audioKey(id));
+      // Only removes it from Selftape; the Telegram message is left alone.
+      await env.DB.prepare('DELETE FROM tracks WHERE id = ?').bind(id).run();
       return json({ ok: true });
     }
   }
   return json({ error: 'Not found' }, 404);
 }
 
+// ---------- database ----------
+
+let schemaReady = false;
+async function ensureSchema(env) {
+  if (schemaReady) return;
+  await env.DB.batch([
+    env.DB.prepare(`CREATE TABLE IF NOT EXISTS tracks (
+      id TEXT PRIMARY KEY, title TEXT NOT NULL, artist TEXT NOT NULL DEFAULT '',
+      duration REAL NOT NULL DEFAULT 0, size INTEGER NOT NULL DEFAULT 0,
+      type TEXT NOT NULL DEFAULT 'audio/mpeg', added_at INTEGER NOT NULL, source TEXT NOT NULL DEFAULT '',
+      file_id TEXT NOT NULL, file_unique_id TEXT, chat_id TEXT, message_id INTEGER)`),
+    env.DB.prepare('CREATE INDEX IF NOT EXISTS tracks_file_unique ON tracks(file_unique_id)'),
+    env.DB.prepare('CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)'),
+  ]);
+  schemaReady = true;
+}
+
+async function getKV(env, key, fallback) {
+  const row = await env.DB.prepare('SELECT value FROM kv WHERE key = ?').bind(key).first();
+  return row ? JSON.parse(row.value) : fallback;
+}
+
+function setKV(env, key, value) {
+  return env.DB.prepare('INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
+    .bind(key, JSON.stringify(value)).run();
+}
+
+const getTgConfig = (env) => getKV(env, 'telegram', { ownerIds: [] });
+
+function insertTrack(env, t) {
+  return env.DB.prepare(`INSERT INTO tracks (id, title, artist, duration, size, type, added_at, source, file_id, file_unique_id, chat_id, message_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind(t.id, t.title, t.artist || '', t.duration || 0, t.size || 0, t.type, t.addedAt, t.source,
+      t.fileId, t.fileUniqueId || null, t.chatId != null ? String(t.chatId) : null, t.messageId ?? null)
+    .run();
+}
+
+const getRow = (env, id) => env.DB.prepare('SELECT * FROM tracks WHERE id = ?').bind(id).first();
+
+const toTrack = (r) => ({
+  id: r.id, title: r.title, artist: r.artist, duration: r.duration, size: r.size,
+  type: r.type, addedAt: r.added_at, source: r.source,
+});
+
 // ---------- library ----------
 
 async function getLibrary(env) {
-  const objects = await listAll(env.BUCKET, 'audio/');
-  const tracks = objects.map(toTrack);
-  const pl = await env.BUCKET.get('playlists.json');
-  const playlists = pl ? await pl.json() : { updatedAt: 0, items: [] };
-  return json({ libraryId: await libraryId(env), tracks, playlists });
-}
-
-async function libraryId(env) {
-  const obj = await env.BUCKET.get('library.json');
-  if (obj) return (await obj.json()).id;
-  const id = crypto.randomUUID();
-  await putJson(env, 'library.json', { id, createdAt: Date.now() });
-  return id;
+  const { results } = await env.DB.prepare('SELECT * FROM tracks ORDER BY added_at DESC').all();
+  const playlists = await getKV(env, 'playlists', { updatedAt: 0, items: [] });
+  let libraryId = await getKV(env, 'libraryId', null);
+  if (!libraryId) {
+    libraryId = crypto.randomUUID();
+    await setKV(env, 'libraryId', libraryId);
+  }
+  const cfg = await getTgConfig(env);
+  return json({
+    libraryId,
+    tracks: results.map(toTrack),
+    playlists,
+    telegram: { connected: !!(cfg.ownerIds || []).length, channel: cfg.channelTitle || null },
+  });
 }
 
 async function putPlaylists(request, env) {
@@ -93,65 +141,82 @@ async function putPlaylists(request, env) {
       createdAt: Number(p.createdAt) || Date.now(),
     })),
   };
-  await putJson(env, 'playlists.json', data);
+  await setKV(env, 'playlists', data);
   return json({ ok: true, updatedAt: data.updatedAt });
 }
 
 // ---------- tracks ----------
 
+// Upload from the app: the file goes into your Telegram channel (or your chat with the bot).
 async function uploadTrack(request, env) {
   const h = request.headers;
   const id = h.get('x-id') || crypto.randomUUID();
   if (!ID_RE.test(id)) return json({ error: 'Bad track id' }, 400);
-  if (!Number(h.get('content-length'))) return json({ error: 'Empty upload' }, 411);
+
+  const existing = await getRow(env, id);
+  if (existing) return json(toTrack(existing)); // retry of an upload that already worked
+
+  const cfg = await getTgConfig(env);
+  const target = cfg.channelId || (cfg.ownerIds || [])[0];
+  if (!env.BOT_TOKEN || !target) return json({ error: 'Connect the Telegram bot first (Settings → Connect bot)' }, 409);
+
+  const buf = await request.arrayBuffer();
+  if (!buf.byteLength) return json({ error: 'Empty upload' }, 411);
+  if (buf.byteLength > MAX_TG_BYTES) return json({ error: 'Too big for Telegram storage (20 MB max)' }, 413);
+
   const title = clean(dec(h.get('x-title'))) || 'Untitled';
   const artist = clean(dec(h.get('x-artist')), 60);
-  const contentType = h.get('content-type') || 'audio/mpeg';
-  const metadata = {
-    title, artist,
-    duration: String(Number(h.get('x-duration')) || 0),
-    addedAt: String(Number(h.get('x-added-at')) || Date.now()),
+  const type = (h.get('content-type') || 'audio/mpeg').split(';')[0];
+  const duration = Number(h.get('x-duration')) || 0;
+  const filename = clean(dec(h.get('x-filename')), 200) || `${title}.${EXT_BY_MIME[type] || 'mp3'}`;
+
+  const asAudio = /^audio\/(mpeg|mp3|mp4|x-m4a|m4a|aac)$/.test(type);
+  const form = new FormData();
+  form.append('chat_id', String(target));
+  form.append(asAudio ? 'audio' : 'document', new Blob([buf], { type }), filename);
+  form.append('disable_notification', 'true');
+  if (asAudio) {
+    form.append('title', title);
+    if (artist) form.append('performer', artist);
+    if (duration) form.append('duration', String(Math.round(duration)));
+  }
+  const msg = await tg(env, asAudio ? 'sendAudio' : 'sendDocument', form);
+  const file = msg.audio || msg.document || msg.voice;
+  if (!file) throw new Error('Telegram did not store the file');
+
+  const track = {
+    id, title, artist, duration, type,
+    size: file.file_size || buf.byteLength,
+    addedAt: Number(h.get('x-added-at')) || Date.now(),
     source: 'app',
+    fileId: file.file_id, fileUniqueId: file.file_unique_id,
+    chatId: target, messageId: msg.message_id,
   };
-  const obj = await env.BUCKET.put(audioKey(id), request.body, {
-    httpMetadata: { contentType },
-    customMetadata: encodeMeta(metadata),
-  });
-  return json(toTrack(obj));
+  await insertTrack(env, track);
+  return json(toTrack({ ...track, added_at: track.addedAt }));
 }
 
 async function getAudio(id, env) {
-  const obj = await env.BUCKET.get(audioKey(id));
-  if (!obj) return json({ error: 'Not found' }, 404);
-  return new Response(obj.body, {
-    headers: {
-      'content-type': obj.httpMetadata?.contentType || 'audio/mpeg',
-      'content-length': String(obj.size),
-      'cache-control': 'private, max-age=31536000, immutable',
-    },
-  });
+  const row = await getRow(env, id);
+  if (!row) return json({ error: 'Not found' }, 404);
+  const info = await tg(env, 'getFile', { file_id: row.file_id });
+  const res = await fetch(`https://api.telegram.org/file/bot${env.BOT_TOKEN}/${info.file_path}`);
+  if (!res.ok) return json({ error: `Telegram download failed (${res.status})` }, 502);
+  const headers = { 'content-type': row.type || 'audio/mpeg', 'cache-control': 'private, no-store' };
+  const len = res.headers.get('content-length');
+  if (len) headers['content-length'] = len;
+  return new Response(res.body, { headers });
 }
 
 async function updateTrack(id, request, env) {
   const body = await request.json().catch(() => ({}));
-  const obj = await env.BUCKET.get(audioKey(id));
-  if (!obj) return json({ error: 'Not found' }, 404);
-  const old = decodeMeta(obj.customMetadata);
-  const next = {
-    ...old,
-    title: clean(body.title) || old.title || 'Untitled',
-    artist: body.artist !== undefined ? clean(body.artist, 60) : old.artist || '',
-    duration: !Number(old.duration) && Number(body.duration) ? String(Number(body.duration)) : old.duration || '0',
-  };
-  // R2 has no "update metadata" call, so rewrite the object with the new metadata.
-  const { readable, writable } = new FixedLengthStream(obj.size);
-  const pipe = obj.body.pipeTo(writable);
-  const saved = await env.BUCKET.put(audioKey(id), readable, {
-    httpMetadata: obj.httpMetadata,
-    customMetadata: encodeMeta(next),
-  });
-  await pipe;
-  return json(toTrack(saved));
+  const row = await getRow(env, id);
+  if (!row) return json({ error: 'Not found' }, 404);
+  const title = clean(body.title) || row.title;
+  const artist = body.artist !== undefined ? clean(body.artist, 60) : row.artist;
+  const duration = !row.duration && Number(body.duration) ? Number(body.duration) : row.duration;
+  await env.DB.prepare('UPDATE tracks SET title = ?, artist = ?, duration = ? WHERE id = ?').bind(title, artist, duration, id).run();
+  return json(toTrack({ ...row, title, artist, duration }));
 }
 
 // ---------- telegram ----------
@@ -162,17 +227,17 @@ async function setupTelegram(env, url) {
   await tg(env, 'setWebhook', {
     url: `${url.origin}/telegram`,
     secret_token: await webhookSecret(env),
-    allowed_updates: ['message'],
+    allowed_updates: ['message', 'channel_post', 'my_chat_member'],
   });
   const cfg = await getTgConfig(env);
   cfg.claimCode = randomHex(16);
   cfg.claimExpires = Date.now() + 30 * 60 * 1000;
-  await putJson(env, 'telegram.json', cfg);
+  await setKV(env, 'telegram', cfg);
   return json({
     ok: true,
     bot: me.username,
     link: `https://t.me/${me.username}?start=${cfg.claimCode}`,
-    connectedUsers: (cfg.ownerIds || []).length,
+    channel: cfg.channelTitle || null,
   });
 }
 
@@ -181,18 +246,26 @@ async function telegramWebhook(request, env, ctx) {
     return new Response('forbidden', { status: 403 });
   }
   const update = await request.json().catch(() => null);
-  if (update?.message) {
-    // Answer Telegram right away; do the download in the background.
-    ctx.waitUntil(handleMessage(update.message, env).catch((err) => console.error('bot error', err)));
+  if (update) {
+    // Answer Telegram right away; do the work in the background.
+    ctx.waitUntil(handleUpdate(update, env).catch((err) => console.error('bot error', err)));
   }
   return new Response('ok');
 }
 
-async function handleMessage(msg, env) {
-  const chatId = msg.chat?.id;
-  const userId = msg.from?.id != null ? String(msg.from.id) : '';
-  if (!chatId || !userId) return;
+async function handleUpdate(update, env) {
+  if (update.message) return handleMessage(update.message, env);
+  if (update.channel_post) return handleChannelPost(update.channel_post, env);
+  if (update.my_chat_member) return handleMembership(update.my_chat_member, env);
+}
 
+const ownerSet = (cfg) => new Set((cfg.ownerIds || []).map(String));
+
+// Messages in your private chat with the bot.
+async function handleMessage(msg, env) {
+  if (msg.chat?.type !== 'private') return;
+  const chatId = msg.chat.id;
+  const userId = String(msg.from?.id ?? '');
   const cfg = await getTgConfig(env);
   const text = (msg.text || '').trim();
 
@@ -200,52 +273,121 @@ async function handleMessage(msg, env) {
   if (text.startsWith('/start ')) {
     const code = text.slice(7).trim();
     if (cfg.claimCode && code === cfg.claimCode && Date.now() < cfg.claimExpires) {
-      cfg.ownerIds = [...new Set([...(cfg.ownerIds || []), userId])];
+      cfg.ownerIds = [...new Set([...(cfg.ownerIds || []).map(String), userId])];
       cfg.claimCode = null;
-      await putJson(env, 'telegram.json', cfg);
-      return reply(env, chatId, "✅ Connected! Send or forward me audio files and they'll show up in your library.\n\nTip: add a caption to set the title.");
+      await setKV(env, 'telegram', cfg);
+      return reply(env, chatId,
+        "✅ Connected to Selftape!\n\n" +
+        "Next: add me as an admin of your music channel (Channel → Administrators → Add admin → search for me). " +
+        "After that, everything you post in the channel shows up in the app.\n\n" +
+        "To add tracks that are already in the channel, forward them to me here.");
     }
   }
 
-  const extra = String(env.ALLOWED_USER_ID || '').split(',').map((s) => s.trim()).filter(Boolean);
-  const owners = new Set([...(cfg.ownerIds || []), ...extra]);
-  if (!owners.has(userId)) return reply(env, chatId, 'This is a private bot.');
+  if (!ownerSet(cfg).has(userId)) return reply(env, chatId, 'This is a private bot.');
 
-  const file = pickAudio(msg);
-  if (!file) {
-    return reply(env, chatId, "Send or forward me an audio file and I'll add it to your library. Add a caption to set the title.");
-  }
-  if (file.file_size && file.file_size > MAX_BOT_BYTES) {
-    const mb = (file.file_size / 1048576).toFixed(1);
-    return reply(env, chatId, `That file is ${mb} MB. Telegram only lets bots download files up to 20 MB — save it to Files and use Import in the app instead.`, msg.message_id);
+  if (text === '/status') {
+    const { results } = await env.DB.prepare('SELECT COUNT(*) AS n FROM tracks').all();
+    return reply(env, chatId, `🎧 ${results[0].n} tracks in Selftape.\n📻 Channel: ${cfg.channelTitle || 'not linked yet (add me as an admin of your channel)'}`);
   }
 
   try {
-    const info = await tg(env, 'getFile', { file_id: file.file_id });
-    const res = await fetch(`https://api.telegram.org/file/bot${env.BOT_TOKEN}/${info.file_path}`);
-    if (!res.ok) throw new Error(`download failed (${res.status})`);
-    const buf = await res.arrayBuffer();
-
-    const name = file.file_name || String(info.file_path || '').split('/').pop() || '';
-    const mime = file.mime_type && file.mime_type !== 'application/octet-stream' ? file.mime_type : guessMime(name) || 'audio/mpeg';
-    const title =
-      clean(msg.caption) || clean(file.title) || clean(stripExt(name)) ||
-      (file.kind === 'voice' ? `Voice memo ${new Date(msg.date * 1000).toISOString().slice(0, 16).replace('T', ' ')}` : 'Untitled');
-
-    await env.BUCKET.put(audioKey(crypto.randomUUID()), buf, {
-      httpMetadata: { contentType: mime },
-      customMetadata: encodeMeta({
-        title,
-        artist: clean(file.performer, 60),
-        duration: String(file.duration || 0),
-        addedAt: String(Date.now()),
-        source: 'telegram',
-      }),
-    });
-    await reply(env, chatId, `✅ Added “${title}”`, msg.message_id);
+    const result = await addFromMessage(env, msg, cfg, { source: 'telegram', archive: true });
+    if (!result) {
+      return reply(env, chatId, "Send or forward me an audio file and I'll add it to Selftape. Add a caption to set the title.");
+    }
+    if (result.duplicate) return reply(env, chatId, `Already in Selftape: “${result.title}”`, msg.message_id);
+    return reply(env, chatId, `✅ Added “${result.title}”`, msg.message_id);
   } catch (err) {
-    await reply(env, chatId, `⚠️ Couldn't add that: ${err.message}`, msg.message_id);
+    return reply(env, chatId, `⚠️ ${err.message}`, msg.message_id);
   }
+}
+
+// New posts in your linked channel.
+async function handleChannelPost(post, env) {
+  const cfg = await getTgConfig(env);
+  if (!cfg.channelId || String(post.chat.id) !== String(cfg.channelId)) return;
+  try {
+    await addFromMessage(env, post, cfg, { source: 'channel', archive: false });
+  } catch (err) {
+    const name = pickAudio(post)?.file_name || 'a file';
+    await notifyOwners(env, cfg, `⚠️ Couldn't add ${name} from “${cfg.channelTitle}”: ${err.message}`);
+  }
+}
+
+// The bot was added to (or removed from) a channel.
+async function handleMembership(upd, env) {
+  if (upd.chat?.type !== 'channel') return;
+  const cfg = await getTgConfig(env);
+  const status = upd.new_chat_member?.status;
+  const byOwner = ownerSet(cfg).has(String(upd.from?.id ?? ''));
+  if (status === 'administrator' && byOwner) {
+    cfg.channelId = String(upd.chat.id);
+    cfg.channelTitle = upd.chat.title || 'your channel';
+    await setKV(env, 'telegram', cfg);
+    await notifyOwners(env, cfg,
+      `📻 Linked to “${cfg.channelTitle}”. Anything you post there is added to Selftape.\n\n` +
+      'To add tracks that are already in the channel: select them, tap Forward, and send them to me.');
+  } else if ((status === 'left' || status === 'kicked') && String(upd.chat.id) === String(cfg.channelId)) {
+    cfg.channelId = null;
+    cfg.channelTitle = null;
+    await setKV(env, 'telegram', cfg);
+    await notifyOwners(env, cfg, '📻 I was removed from your channel, so it is no longer linked.');
+  }
+}
+
+async function addFromMessage(env, msg, cfg, { source, archive }) {
+  const file = pickAudio(msg);
+  if (!file) return null;
+  if (file.file_size && file.file_size > MAX_TG_BYTES) {
+    throw new Error(`That file is ${(file.file_size / 1048576).toFixed(1)} MB. Telegram only lets bots download files up to 20 MB, so it can't be played in Selftape. Export it as MP3/M4A to make it smaller.`);
+  }
+
+  if (file.file_unique_id) {
+    const dup = await env.DB.prepare('SELECT title FROM tracks WHERE file_unique_id = ?').bind(file.file_unique_id).first();
+    if (dup) return { duplicate: true, title: dup.title };
+  }
+
+  let chatId = msg.chat.id;
+  let messageId = msg.message_id;
+  const origin = msg.forward_origin;
+  const fromOwnChannel = origin?.type === 'channel' && cfg.channelId && String(origin.chat?.id) === String(cfg.channelId);
+  if (fromOwnChannel) {
+    // Forwarded from the channel: it's already archived there.
+    chatId = origin.chat.id;
+    messageId = origin.message_id;
+  } else if (archive && cfg.channelId) {
+    // Keep a copy in the channel so all your music lives in one place.
+    try {
+      const copy = await tg(env, 'copyMessage', { chat_id: cfg.channelId, from_chat_id: msg.chat.id, message_id: msg.message_id, disable_notification: true });
+      chatId = cfg.channelId;
+      messageId = copy.message_id;
+    } catch (err) {
+      console.error('copy to channel failed', err);
+    }
+  }
+
+  const name = file.file_name || '';
+  const type = file.mime_type && file.mime_type !== 'application/octet-stream' ? file.mime_type : guessMime(name) || 'audio/mpeg';
+  const title =
+    clean(msg.caption) || clean(file.title) || clean(stripExt(name)) ||
+    (file.kind === 'voice' ? `Voice memo ${new Date(msg.date * 1000).toISOString().slice(0, 16).replace('T', ' ')}` : 'Untitled');
+
+  await insertTrack(env, {
+    id: crypto.randomUUID(),
+    title,
+    artist: clean(file.performer, 60),
+    duration: file.duration || 0,
+    size: file.file_size || 0,
+    type,
+    addedAt: Date.now(),
+    source,
+    fileId: file.file_id,
+    fileUniqueId: file.file_unique_id,
+    chatId,
+    messageId,
+  });
+  return { title };
 }
 
 function pickAudio(msg) {
@@ -257,10 +399,11 @@ function pickAudio(msg) {
 }
 
 async function tg(env, method, params) {
+  const isForm = params instanceof FormData;
   const res = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(params),
+    headers: isForm ? undefined : { 'content-type': 'application/json' },
+    body: isForm ? params : JSON.stringify(params),
   });
   const data = await res.json().catch(() => ({}));
   if (!data.ok) throw new Error(data.description || `Telegram ${method} failed`);
@@ -273,9 +416,8 @@ function reply(env, chatId, text, replyTo) {
   return tg(env, 'sendMessage', params);
 }
 
-async function getTgConfig(env) {
-  const obj = await env.BUCKET.get('telegram.json');
-  return obj ? await obj.json() : { ownerIds: [] };
+async function notifyOwners(env, cfg, text) {
+  for (const id of cfg.ownerIds || []) await reply(env, id, text).catch(() => {});
 }
 
 async function webhookSecret(env) {
@@ -295,39 +437,11 @@ function corsHeaders(env) {
   return {
     'access-control-allow-origin': env.ALLOWED_ORIGIN || '*',
     'access-control-allow-methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
-    'access-control-allow-headers': 'authorization, content-type, x-id, x-title, x-artist, x-duration, x-added-at',
+    'access-control-allow-headers': 'authorization, content-type, x-id, x-title, x-artist, x-duration, x-added-at, x-filename',
     'access-control-max-age': '86400',
+    vary: 'origin',
   };
 }
-
-async function listAll(bucket, prefix) {
-  const out = [];
-  let cursor;
-  do {
-    const page = await bucket.list({ prefix, cursor, include: ['customMetadata', 'httpMetadata'] });
-    out.push(...page.objects);
-    cursor = page.truncated ? page.cursor : undefined;
-  } while (cursor);
-  return out;
-}
-
-function toTrack(obj) {
-  const m = decodeMeta(obj.customMetadata);
-  return {
-    id: obj.key.slice('audio/'.length),
-    title: m.title || 'Untitled',
-    artist: m.artist || '',
-    duration: Number(m.duration) || 0,
-    size: obj.size,
-    type: obj.httpMetadata?.contentType || 'audio/mpeg',
-    addedAt: Number(m.addedAt) || new Date(obj.uploaded).getTime(),
-    source: m.source || '',
-  };
-}
-
-// Metadata values are URI-encoded so any title (emoji, accents…) survives storage.
-const encodeMeta = (m) => Object.fromEntries(Object.entries(m).map(([k, v]) => [k, encodeURIComponent(String(v ?? ''))]));
-const decodeMeta = (m = {}) => Object.fromEntries(Object.entries(m).map(([k, v]) => [k, dec(v)]));
 
 function dec(s) {
   if (!s) return '';
@@ -340,9 +454,6 @@ function clean(s, max = 120) {
 
 const stripExt = (name) => String(name || '').replace(/\.[^.]+$/, '').replace(/_+/g, ' ');
 const guessMime = (name) => MIME_BY_EXT[(String(name).split('.').pop() || '').toLowerCase()] || '';
-const audioKey = (id) => `audio/${id}`;
-const putJson = (env, key, data) =>
-  env.BUCKET.put(key, JSON.stringify(data), { httpMetadata: { contentType: 'application/json' } });
 
 const json = (data, status = 200) =>
   new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json' } });

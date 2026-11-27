@@ -43,6 +43,7 @@ export const uploadTrack = async (s, t, blob) =>
       'x-artist': encodeURIComponent(t.artist || ''),
       'x-duration': String(t.duration || 0),
       'x-added-at': String(t.addedAt || Date.now()),
+      'x-filename': encodeURIComponent(t.filename || ''),
     },
   })).json();
 

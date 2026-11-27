@@ -44,6 +44,7 @@ const state = {
   search: '',
   syncing: false,
   syncError: '',
+  telegram: null,
   lastSync: 0,
 };
 let listIds = []; // track ids currently shown, in order (used as the play queue)
@@ -55,6 +56,8 @@ const savePlaylistsLocal = () => db.put('kv', state.playlists, 'playlists');
 const findPlaylist = (id) => state.playlists.items.find((p) => p.id === id);
 const playlistTracks = (pl) => pl.trackIds.map((id) => state.tracks.get(id)).filter(Boolean);
 const isPendingUpload = (id) => state.pending.uploads.includes(id);
+const isLocalOnly = (id) => !!state.tracks.get(id)?.localOnly;
+const cloudCopy = (id) => !isPendingUpload(id) && !isLocalOnly(id);
 
 function changePlaylists(fn) {
   fn(state.playlists.items);
@@ -138,6 +141,7 @@ async function importFiles(files) {
     const t = {
       id: uid(),
       title: stripExt(file.name) || 'Untitled',
+      filename: file.name,
       artist: '',
       duration: await probeDuration(blob),
       size: blob.size,
@@ -192,7 +196,7 @@ async function sync(manual = false) {
     let lib = await api.getLibrary(s);
     if (s.libraryId && lib.libraryId !== s.libraryId) {
       const serverIds = new Set(lib.tracks.map((t) => t.id));
-      for (const id of state.downloaded) if (!serverIds.has(id) && !p.uploads.includes(id)) p.uploads.push(id);
+      for (const id of state.downloaded) if (!serverIds.has(id) && !p.uploads.includes(id) && !isLocalOnly(id)) p.uploads.push(id);
       p.playlistsDirty = true;
     }
     if (s.libraryId !== lib.libraryId) { s.libraryId = lib.libraryId; await saveSettings(); }
@@ -204,10 +208,27 @@ async function sync(manual = false) {
       await savePending();
       pushed = true;
     }
+    let uploadProblem = '';
     for (const id of [...p.uploads]) {
       const t = state.tracks.get(id);
       const blob = t && (await db.get('blobs', id));
-      if (t && blob) await api.uploadTrack(s, t, blob);
+      if (t && blob) {
+        try {
+          await api.uploadTrack(s, t, blob);
+        } catch (err) {
+          if (err.status === 413) {
+            // Too big for Telegram: keep it on this phone only.
+            t.localOnly = true;
+            await db.put('tracks', t);
+            toast(`“${t.title}” is over 20 MB, so it stays on this phone only`);
+          } else if (err.status === 409) {
+            uploadProblem = err.message; // bot not connected yet: try again later
+            break;
+          } else {
+            throw err;
+          }
+        }
+      }
       p.uploads = p.uploads.filter((x) => x !== id);
       await savePending();
       updateStatus(id);
@@ -247,9 +268,11 @@ async function sync(manual = false) {
       }
     }
     for (const id of [...state.tracks.keys()]) {
-      if (!serverIds.has(id) && !p.uploads.includes(id)) { await removeTrackLocally(id); changed = true; }
+      if (!serverIds.has(id) && !p.uploads.includes(id) && !state.tracks.get(id)?.localOnly) { await removeTrackLocally(id); changed = true; }
     }
     state.lastSync = Date.now();
+    state.telegram = lib.telegram || null;
+    if (uploadProblem) state.syncError = uploadProblem;
     if (changed) renderView();
     if (s.autoDownload) backgroundDownload();
     if (manual) toast('Synced');
@@ -362,7 +385,7 @@ function settingsHTML() {
   return `
     <section class="card">
       <h3>Cloud sync</h3>
-      <p class="muted small">Connect to your server so your library and playlists sync everywhere, and the Telegram bot can add tracks.</p>
+      <p class="muted small">Connect to your server so your library and playlists sync everywhere.</p>
       <label class="field"><span>Server URL</span><input id="serverUrl" type="url" inputmode="url" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="https://selftape-api.you.workers.dev" value="${esc(s.serverUrl)}"></label>
       <label class="field"><span>App password</span><input id="token" type="password" autocapitalize="off" autocorrect="off" spellcheck="false" value="${esc(s.token)}"></label>
       <div class="row-btns">
@@ -373,7 +396,8 @@ function settingsHTML() {
     </section>
     <section class="card">
       <h3>Telegram bot</h3>
-      <p class="muted small">Send or forward audio to your bot and it lands in your library. Add a caption to set the title. Files up to 20 MB.</p>
+      <p class="muted small">Your music is stored in Telegram. After connecting, add the bot as an admin of your music channel: everything you post there shows up here. You can also send or forward tracks to the bot. Files up to 20 MB.</p>
+      ${state.telegram?.channel ? `<p class="small">📻 Linked to <b>${esc(state.telegram.channel)}</b></p>` : ''}
       <button class="pill" data-action="connect-telegram" ${configured() ? '' : 'disabled'}>${icon('telegram')} Connect bot</button>
     </section>
     <section class="card">
@@ -397,6 +421,7 @@ const emptyHTML = (title, sub) => `<div class="empty"><div class="t">${esc(title
 function statusIcon(id) {
   if (state.downloading.has(id)) return '<span class="spinner"></span>';
   if (isPendingUpload(id)) return icon('upload');
+  if (isLocalOnly(id)) return '<span class="tag">phone only</span>';
   if (!state.downloaded.has(id)) return icon('cloud');
   return '';
 }
@@ -633,7 +658,7 @@ async function trackMenu(id, index) {
     { key: 'edit', label: 'Edit title & artist', icon: 'edit' },
   ];
   if (!state.downloaded.has(id)) items.push({ key: 'download', label: 'Download to phone', icon: 'download' });
-  else if (configured() && !isPendingUpload(id)) items.push({ key: 'undownload', label: 'Remove download', icon: 'x' });
+  else if (configured() && cloudCopy(id)) items.push({ key: 'undownload', label: 'Remove download', icon: 'x' });
   if (inPlaylist) {
     items.push({ key: 'up', label: 'Move up', icon: 'up' }, { key: 'down', label: 'Move down', icon: 'down' });
     items.push({ key: 'remove', label: 'Remove from playlist', icon: 'x' });
@@ -781,7 +806,7 @@ async function connectTelegram() {
 }
 
 async function removeDownloads() {
-  const removable = [...state.downloaded].filter((id) => !isPendingUpload(id) && id !== player.currentId);
+  const removable = [...state.downloaded].filter((id) => cloudCopy(id) && id !== player.currentId);
   if (!removable.length) return toast('Nothing to remove');
   if (!confirm(`Remove ${plural(removable.length, 'downloaded track')} from this phone? They stay in the cloud and download again when you play them.`)) return;
   for (const id of removable) {

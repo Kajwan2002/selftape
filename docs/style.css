@@ -97,6 +97,8 @@ body.has-mini .view { padding-bottom: calc(var(--tabs-h) + var(--mini-h) + var(-
 .status { width: 22px; display: grid; place-items: center; color: var(--muted); flex: none; }
 .status svg { width: 18px; height: 18px; }
 .more, .chev { color: var(--muted); }
+.tag { font-size: 10px; font-weight: 600; white-space: nowrap; padding: 2px 6px; border-radius: 6px; background: var(--surface-2); color: var(--muted); }
+.row .status:has(.tag) { width: auto; }
 
 .art {
   width: 46px; height: 46px; border-radius: 10px; flex: none;
