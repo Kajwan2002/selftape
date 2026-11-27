@@ -294,7 +294,7 @@ async function handleMessage(msg, env) {
   try {
     const result = await addFromMessage(env, msg, cfg, { source: 'telegram', archive: true });
     if (!result) {
-      return reply(env, chatId, "Send or forward me an audio file and I'll add it to Selftape. Add a caption to set the title.");
+      return reply(env, chatId, "Send or forward me an audio file and I'll add it to Selftape. I use the song's own title and artist; a caption is only used if the file has no title.");
     }
     if (result.duplicate) return reply(env, chatId, `Already in Selftape: “${result.title}”`, msg.message_id);
     return reply(env, chatId, `✅ Added “${result.title}”`, msg.message_id);
@@ -369,8 +369,9 @@ async function addFromMessage(env, msg, cfg, { source, archive }) {
 
   const name = file.file_name || '';
   const type = file.mime_type && file.mime_type !== 'application/octet-stream' ? file.mime_type : guessMime(name) || 'audio/mpeg';
+  // The song's own tags win; the caption is only used when the file has no title.
   const title =
-    clean(msg.caption) || clean(file.title) || clean(stripExt(name)) ||
+    clean(file.title) || clean(msg.caption) || clean(stripExt(name)) ||
     (file.kind === 'voice' ? `Voice memo ${new Date(msg.date * 1000).toISOString().slice(0, 16).replace('T', ' ')}` : 'Untitled');
 
   await insertTrack(env, {

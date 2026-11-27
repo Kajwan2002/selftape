@@ -43,7 +43,7 @@ class Player extends EventTarget {
 
     const a = this.audio;
     a.addEventListener('ended', () => { if (!this.isSilent) this.next(true); });
-    a.addEventListener('play', () => this.emit());
+    a.addEventListener('play', () => { if (!this.isSilent) this.bindMediaSession(); this.emit(); });
     a.addEventListener('pause', () => this.emit());
     a.addEventListener('loadedmetadata', () => {
       const id = this.currentId;
@@ -56,15 +56,24 @@ class Player extends EventTarget {
       if (now - last > 1000) { last = now; this.updatePosition(); }
     });
 
+    this.bindMediaSession();
+  }
+
+  // Lock-screen / AirPods controls. iOS shows "skip 10 seconds" buttons unless
+  // next/previous track handlers are set and the seek-skip handlers are cleared,
+  // and it can drop handlers when the audio source changes, so this runs again
+  // every time a new track loads.
+  bindMediaSession() {
     const ms = navigator.mediaSession;
-    if (ms) {
-      const set = (action, fn) => { try { ms.setActionHandler(action, fn); } catch {} };
-      set('play', () => this.play());
-      set('pause', () => this.audio.pause());
-      set('previoustrack', () => this.prev());
-      set('nexttrack', () => this.next());
-      set('seekto', (d) => this.seek(d.seekTime));
-    }
+    if (!ms) return;
+    const set = (action, fn) => { try { ms.setActionHandler(action, fn); } catch {} };
+    set('seekbackward', null);
+    set('seekforward', null);
+    set('play', () => this.play());
+    set('pause', () => this.audio.pause());
+    set('previoustrack', () => this.prev());
+    set('nexttrack', () => this.next());
+    set('seekto', (d) => this.seek(d.seekTime));
   }
 
   init(hooks) { Object.assign(this.hooks, hooks); }
@@ -233,6 +242,7 @@ class Player extends EventTarget {
     const ms = navigator.mediaSession;
     const t = this.hooks.getTrack(this.currentId);
     if (!ms || !t || !window.MediaMetadata) return;
+    this.bindMediaSession();
     const base = new URL('icons/', location.href).href;
     ms.metadata = new MediaMetadata({
       title: t.title,
