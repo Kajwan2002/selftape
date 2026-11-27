@@ -3,7 +3,7 @@ import * as api from './api.js';
 import { player } from './player.js';
 import { icon } from './icons.js';
 
-const APP_VERSION = 'v19'; // keep in sync with VERSION in sw.js
+const APP_VERSION = 'v20'; // keep in sync with VERSION in sw.js
 
 // ---------- helpers ----------
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -740,16 +740,56 @@ function libraryHTML() {
 const splitArtists = (s) => String(s || '').split(/\s*(?:,|;|\/|\bfeat\.?|\bft\.?|\bfeaturing\b)\s*/i).map((x) => x.trim()).filter(Boolean);
 const artistKey = (name) => name.toLowerCase().replace(/\s+/g, ' ').trim();
 
+// Groups songs by artist. Spellings that are clearly the same person
+// ("Afshin Moghadam" / "Afshin Moghaddam", "Guns N Roses" / "Guns N' Roses")
+// are shown as one artist, using the spelling found on the most songs.
 function artistIndex() {
-  const map = new Map();
+  // 1) count every spelling
+  const spellings = new Map(); // exact key -> { name, ids }
   for (const t of [...state.tracks.values()].sort(newestFirst)) {
     for (const name of splitArtists(t.artist)) {
       const key = artistKey(name);
-      if (!map.has(key)) map.set(key, { key, name, ids: [] });
-      map.get(key).ids.push(t.id);
+      if (!spellings.has(key)) spellings.set(key, { name, ids: [] });
+      spellings.get(key).ids.push(t.id);
     }
   }
-  return map;
+  // 2) merge near-identical spellings, most common first
+  const groups = [];
+  for (const [key, sp] of [...spellings].sort((a, b) => b[1].ids.length - a[1].ids.length)) {
+    const g = groups.find((x) => sameArtist(x.key, key));
+    if (g) {
+      g.variants.add(sp.name);
+      for (const id of sp.ids) if (!g.ids.includes(id)) g.ids.push(id);
+    } else {
+      groups.push({ key, name: sp.name, ids: sp.ids.slice(), variants: new Set([sp.name]) });
+    }
+  }
+  return new Map(groups.map((g) => [g.key, g]));
+}
+
+// Same artist, spelled slightly differently? Only for longer names, so short
+// different names ("Drake" / "Drak") stay apart.
+function sameArtist(a, b) {
+  if (a === b) return true;
+  const flat = (x) => x.normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+    .replace(/&/g, 'and').replace(/\b(the|and|n)\b/g, '').replace(/[^\p{L}\p{N}]+/gu, '');
+  const fa = flat(a);
+  const fb = flat(b);
+  if (!fa || !fb) return false;
+  if (fa === fb) return true;
+  const squash = (x) => x.replace(/(.)\1+/g, '$1'); // "moghaddam" -> "moghadam"
+  if (fa.length >= 5 && squash(fa) === squash(fb)) return true;
+  return Math.min(fa.length, fb.length) >= 8 && textSimilarity(fa, fb) >= 0.9;
+}
+
+function textSimilarity(a, b) {
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    prev = cur;
+  }
+  return 1 - prev[b.length] / Math.max(a.length, b.length);
 }
 
 const artistCoverId = (a) => a.ids.find((id) => state.tracks.get(id)?.cover) || a.ids[0];
@@ -817,11 +857,14 @@ async function checkArtistPhotos(artists) {
 
 async function artistMenu(a) {
   const has = !!state.artistPhotos[a.key];
+  const others = [...a.variants].filter((v) => v !== a.name);
   const key = await menu(a.name, [
-    { key: 'pick', label: has ? 'Change photo…' : 'Choose photo…', icon: 'search' },
-    ...(has ? [{ key: 'none', label: 'Use a song cover instead', icon: 'x' }] : []),
-  ]);
+    { key: 'rename', label: 'Rename artist…', icon: 'edit' },
+    ...(configured() ? [{ key: 'pick', label: has ? 'Change photo…' : 'Choose photo…', icon: 'search' }] : []),
+    ...(configured() && has ? [{ key: 'none', label: 'Use a song cover instead', icon: 'x' }] : []),
+  ], others.length ? `Also spelled: ${others.join(', ')}` : '');
   if (!key) return;
+  if (key === 'rename') return renameArtist(a);
   const url = key === 'pick'
     ? await imagePicker({ title: 'Choose a photo', hint: 'Search for the artist, then tap the right photo.', query: a.name, round: true,
         search: (q) => api.artistPhotoOptions(state.settings, q) })
@@ -833,6 +876,31 @@ async function artistMenu(a) {
     db.put('kv', state.artistPhotos, 'artistPhotos');
     renderView();
   } catch (err) { toast(err.message); }
+}
+
+// Rename an artist on all their songs (also merges the different spellings).
+async function renameArtist(a) {
+  const v = await form('Rename artist', [{ name: 'name', label: `New name for all ${plural(a.ids.length, 'song')}`, value: a.name }], 'Rename');
+  const name = v?.name?.trim();
+  if (!name) return;
+  const variants = [...a.variants].sort((x, y) => y.length - x.length);
+  const esc2 = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  for (const id of a.ids) {
+    const t = state.tracks.get(id);
+    if (!t) continue;
+    let artist = t.artist || '';
+    for (const old of variants) artist = artist.replace(new RegExp(esc2(old), 'ig'), name);
+    if (artist === t.artist) continue;
+    t.artist = artist;
+    await db.put('tracks', t);
+    if (!isPendingUpload(t.id) && !state.pending.renames.includes(t.id)) state.pending.renames.push(t.id);
+  }
+  await savePending();
+  toast(`Renamed to “${name}”`);
+  state.view = { name: 'artist', key: artistKey(name) };
+  renderView();
+  renderPlayer();
+  scheduleSync();
 }
 
 function artistHTML(a) {
@@ -848,7 +916,7 @@ function artistHTML(a) {
       <button class="pill primary" data-action="play-list">${icon('play')} Play</button>
       <button class="pill" data-action="shuffle-list">${icon('shuffle')} Shuffle</button>
       <span class="grow"></span>
-      ${configured() ? `<button class="icon-btn more" data-action="artist-menu" aria-label="Artist options">${icon('more')}</button>` : ''}
+      <button class="icon-btn more" data-action="artist-menu" aria-label="Artist options">${icon('more')}</button>
     </div>
     <div id="list" class="list"></div>`;
 }

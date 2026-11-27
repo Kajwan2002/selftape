@@ -1,6 +1,6 @@
 // Caches the app itself so it opens offline. Audio lives in IndexedDB, not here.
 // Bump VERSION when you change the app so phones pick up the new files.
-const VERSION = 'v19';
+const VERSION = 'v20';
 const CACHE = `selftape-${VERSION}`;
 const SHELL = [
   './', './index.html', './style.css', './app.js', './db.js', './api.js', './player.js', './icons.js',
