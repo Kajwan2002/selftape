@@ -127,6 +127,7 @@ class Player extends EventTarget {
     this.index = i;
     const id = this.queue[i];
     const token = ++this.token;
+    this.pendingTime = null;
     this.loadingId = id;
     this.emit();
 
@@ -149,7 +150,8 @@ class Player extends EventTarget {
     if (this.resumeAt?.id === id) {
       const t = this.resumeAt.time;
       this.resumeAt = null;
-      this.audio.addEventListener('loadedmetadata', () => { this.audio.currentTime = Math.min(t, (this.audio.duration || t + 1) - 1); this.emit(); }, { once: true });
+      this.pendingTime = t; // remembered until the song is ready, so saving doesn't lose it
+      this.audio.addEventListener('loadedmetadata', () => { this.audio.currentTime = Math.min(t, (this.audio.duration || t + 1) - 1); this.pendingTime = null; this.emit(); }, { once: true });
     }
     this.loadingId = null;
     this.updateMetadata();
@@ -277,7 +279,9 @@ class Player extends EventTarget {
     return {
       queue: this.queue, original: this.original, index: this.index,
       shuffle: this.shuffle, repeat: this.repeat, context: this.context,
-      time: this.isSilent ? (this.resumeAt?.time || 0) : this.audio.currentTime || 0,
+      time: this.resumeAt?.id === this.currentId ? this.resumeAt.time
+        : this.pendingTime != null && this.audio.readyState < 1 ? this.pendingTime
+        : this.isSilent ? 0 : this.audio.currentTime || 0,
     };
   }
 

@@ -190,7 +190,21 @@ async function getHistory(env) {
   const { results } = await env.DB.prepare('SELECT track_id, at FROM plays WHERE at > ? ORDER BY at').bind(since).all();
   const plays = {};
   for (const r of results) (plays[r.track_id] ||= []).push(r.at);
-  return { recent: await getKV(env, 'recent', []), plays };
+  return { recent: await getKV(env, 'recent', []), plays, nowPlaying: await getKV(env, 'nowPlaying', null) };
+}
+
+// Where you left off (song, second, queue) - the newest device wins.
+function cleanNowPlaying(np) {
+  if (!np || typeof np !== 'object' || !Array.isArray(np.queue)) return null;
+  const queue = np.queue.map(String).filter((t) => ID_RE.test(t)).slice(0, 5000);
+  const index = Number(np.index);
+  if (!queue.length || !(index >= 0 && index < queue.length) || queue.length !== np.queue.length) return null;
+  const original = Array.isArray(np.original) ? np.original.map(String).filter((t) => ID_RE.test(t)).slice(0, 5000) : queue;
+  const ctx = np.context && typeof np.context === 'object' ? { type: String(np.context.type || ''), id: String(np.context.id || '') } : null;
+  return {
+    queue, original, index, shuffle: !!np.shuffle, repeat: ['off', 'all', 'one'].includes(np.repeat) ? np.repeat : 'off',
+    context: ctx, time: Math.max(0, Number(np.time) || 0), at: Number(np.at) || Date.now(), device: String(np.device || '').slice(0, 40),
+  };
 }
 
 // A device sends its new plays and its "recently played" list; the server merges them.
@@ -206,9 +220,16 @@ async function postHistory(request, env) {
     recent = mergeRecent(body.recent, recent);
     await setKV(env, 'recent', recent);
   }
+  let nowPlaying = null;
+  const np = cleanNowPlaying(body.nowPlaying);
+  if (np) {
+    const cur = await getKV(env, 'nowPlaying', null);
+    if (!cur || np.at >= cur.at) await setKV(env, 'nowPlaying', np);
+    nowPlaying = !cur || np.at >= cur.at ? np : cur;
+  }
   // keep the table small
   await env.DB.prepare('DELETE FROM plays WHERE at < ?').bind(Date.now() - PLAYS_DAYS * 86400e3).run();
-  return json({ ok: true, recent });
+  return json({ ok: true, recent, nowPlaying });
 }
 
 async function putPlaylists(request, env) {

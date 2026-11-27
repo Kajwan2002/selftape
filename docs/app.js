@@ -3,7 +3,7 @@ import * as api from './api.js';
 import { player } from './player.js';
 import { icon } from './icons.js';
 
-const APP_VERSION = 'v20'; // keep in sync with VERSION in sw.js
+const APP_VERSION = 'v21'; // keep in sync with VERSION in sw.js
 
 // ---------- helpers ----------
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -407,7 +407,45 @@ async function pushHistory() {
     p.recentDirty = false;
     await savePending();
     if (Array.isArray(r.recent)) applyServerRecent(r.recent);
+    if (r.nowPlaying) applyServerNowPlaying(r.nowPlaying);
   } catch {}
+}
+
+// ---------- where you left off, shared between devices ----------
+// The newest device to actually play something wins; the others pick it up
+// (paused, at the same second) next time they're opened, unless they're playing.
+const np = { device: '', at: 0, sig: '', pushedAt: 0, lastPush: 0 };
+const npSig = (s) => (s ? `${s.index}|${s.shuffle}|${s.repeat}|${s.queue.join(',')}` : '');
+
+function nowPlayingSnapshot() {
+  const s = player.snapshot();
+  if (!s) return null;
+  const sig = npSig(s);
+  if (sig !== np.sig || player.playing) { np.sig = sig; np.at = Date.now(); }
+  return { ...s, at: np.at, device: np.device };
+}
+
+async function pushNowPlaying(snap, urgent = false) {
+  if (!snap || !configured() || !navigator.onLine || snap.at <= np.pushedAt) return;
+  if (!urgent && Date.now() - np.lastPush < 30000) return;
+  np.lastPush = Date.now();
+  try {
+    await api.postHistory(state.settings, { plays: [], recent: [], nowPlaying: snap }, urgent);
+    np.pushedAt = Math.max(np.pushedAt, snap.at);
+  } catch {}
+}
+
+function applyServerNowPlaying(remote) {
+  if (!remote?.queue?.length || remote.device === np.device || remote.at <= np.at) return;
+  if (player.playing) return; // don't interrupt what you're listening to here
+  if (!remote.queue.every((id) => state.tracks.has(id))) return;
+  np.at = remote.at;
+  np.pushedAt = remote.at;
+  np.sig = npSig(remote);
+  const had = player.currentId != null;
+  player.restore(remote);
+  db.put('kv', { ...remote, device: np.device }, 'playerState');
+  if (had || remote.time > 5) toast('Picked up where you left off on your other device');
 }
 
 // Merge another device's "recently played" into ours (newest first, no duplicates).
@@ -632,6 +670,7 @@ async function sync(manual = false) {
       }
     }
     if (Array.isArray(lib.recent)) applyServerRecent(lib.recent);
+    if (lib.nowPlaying) applyServerNowPlaying(lib.nowPlaying);
     if (lib.artistPhotos && JSON.stringify(lib.artistPhotos) !== JSON.stringify(state.artistPhotos)) {
       state.artistPhotos = lib.artistPhotos;
       db.put('kv', state.artistPhotos, 'artistPhotos');
@@ -2241,15 +2280,25 @@ function bindEvents() {
 
   // Remember what was playing (song, position, queue) so the app picks up where you left off.
   let saveTimer;
-  const savePlayer = () => db.put('kv', player.snapshot(), 'playerState');
-  player.addEventListener('change', () => { clearTimeout(saveTimer); saveTimer = setTimeout(savePlayer, 400); });
+  const savePlayer = (urgent = false) => {
+    const snap = nowPlayingSnapshot();
+    db.put('kv', snap, 'playerState');
+    pushNowPlaying(snap, urgent); // share with your other devices
+  };
+  let lastId = null;
+  player.addEventListener('change', () => {
+    clearTimeout(saveTimer);
+    const songChanged = player.currentId !== lastId;
+    lastId = player.currentId;
+    saveTimer = setTimeout(() => savePlayer(songChanged), 400);
+  });
   let lastPosSave = 0;
   player.audio.addEventListener('timeupdate', () => {
     if (Date.now() - lastPosSave > 5000 && !player.isSilent) { lastPosSave = Date.now(); savePlayer(); }
   });
-  player.audio.addEventListener('pause', savePlayer);
-  document.addEventListener('visibilitychange', () => { if (document.hidden) savePlayer(); });
-  window.addEventListener('pagehide', savePlayer);
+  player.audio.addEventListener('pause', () => savePlayer(true));
+  document.addEventListener('visibilitychange', () => { if (document.hidden) savePlayer(true); });
+  window.addEventListener('pagehide', () => savePlayer(true));
 
   document.addEventListener('visibilitychange', () => { if (!document.hidden) sync(); });
   window.addEventListener('online', () => sync());
@@ -2283,6 +2332,9 @@ async function init() {
   if (playlists) state.playlists = playlists;
   if (settings) Object.assign(state.settings, settings);
   if (pending) Object.assign(state.pending, pending);
+  np.device = (await db.get('kv', 'deviceId')) || '';
+  if (!np.device) { np.device = Math.random().toString(36).slice(2, 12); db.put('kv', np.device, 'deviceId'); }
+  if (playerState?.at) { np.at = playerState.at; np.pushedAt = playerState.at; np.sig = npSig(playerState); }
 
   player.init({
     getBlob: ensureBlob,
