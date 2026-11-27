@@ -58,6 +58,8 @@ export const findMissingGenres = async (s) => (await call(s, '/genres/find-missi
 
 export const deleteTrack = (s, id) => call(s, `/tracks/${id}`, { method: 'DELETE' });
 
+export const postHistory = async (s, data) => (await call(s, '/history', { method: 'POST', ...jsonBody(data) })).json();
+
 export const savePlaylists = (s, data) => call(s, '/playlists', { method: 'PUT', ...jsonBody(data) });
 
 export const getCover = async (s, id) => (await call(s, `/tracks/${id}/cover`)).blob();

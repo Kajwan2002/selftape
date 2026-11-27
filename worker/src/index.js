@@ -48,6 +48,7 @@ async function route(request, env, ctx, url) {
 
   if (pathname === '/library' && method === 'GET') return getLibrary(env);
   if (pathname === '/playlists' && method === 'PUT') return putPlaylists(request, env);
+  if (pathname === '/history' && method === 'POST') return postHistory(request, env);
   if (pathname === '/telegram/setup' && method === 'POST') return setupTelegram(env, url);
   if (pathname === '/covers/find-missing' && method === 'POST') return findMissingCovers(env);
   if (pathname === '/genres/find-missing' && method === 'POST') return findMissingGenres(env);
@@ -91,6 +92,7 @@ async function ensureSchema(env) {
       file_id TEXT NOT NULL, file_unique_id TEXT, chat_id TEXT, message_id INTEGER)`),
     env.DB.prepare('CREATE INDEX IF NOT EXISTS tracks_file_unique ON tracks(file_unique_id)'),
     env.DB.prepare('CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)'),
+    env.DB.prepare('CREATE TABLE IF NOT EXISTS plays (track_id TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (track_id, at))'),
   ]);
   // Columns added after the first release (ignore "duplicate column" errors).
   for (const col of ['cover_file_id TEXT', 'cover_url TEXT', 'cover_checked INTEGER', 'genre TEXT', 'genre_checked INTEGER', 'features TEXT']) {
@@ -161,7 +163,48 @@ async function getLibrary(env) {
     playlists,
     telegram: { connected: !!(cfg.ownerIds || []).length, channel: cfg.channelTitle || null },
     artistPhotos: await getKV(env, 'artistPhotos', {}), // artist key -> photo url ('' = checked, none)
+    ...(await getHistory(env)),
   });
+}
+
+// ---------- listening history (shared by all your devices) ----------
+const RECENT_MAX = 12;
+const PLAYS_DAYS = 120;
+
+function mergeRecent(a, b) {
+  const seen = new Set();
+  return [...a, ...b]
+    .filter((r) => r && r.type && r.id && Number(r.at))
+    .sort((x, y) => y.at - x.at)
+    .filter((r) => { const k = `${r.type}:${r.id}`; if (seen.has(k)) return false; seen.add(k); return true; })
+    .slice(0, RECENT_MAX)
+    .map((r) => ({ type: String(r.type), id: String(r.id), at: Number(r.at) }));
+}
+
+async function getHistory(env) {
+  const since = Date.now() - PLAYS_DAYS * 86400e3;
+  const { results } = await env.DB.prepare('SELECT track_id, at FROM plays WHERE at > ? ORDER BY at').bind(since).all();
+  const plays = {};
+  for (const r of results) (plays[r.track_id] ||= []).push(r.at);
+  return { recent: await getKV(env, 'recent', []), plays };
+}
+
+// A device sends its new plays and its "recently played" list; the server merges them.
+async function postHistory(request, env) {
+  const body = await request.json().catch(() => ({}));
+  const plays = (Array.isArray(body.plays) ? body.plays : []).slice(0, 500)
+    .filter((p) => ID_RE.test(String(p.id || '')) && Number(p.at) > 0);
+  if (plays.length) {
+    await env.DB.batch(plays.map((p) => env.DB.prepare('INSERT OR IGNORE INTO plays (track_id, at) VALUES (?, ?)').bind(String(p.id), Number(p.at))));
+  }
+  let recent = await getKV(env, 'recent', []);
+  if (Array.isArray(body.recent) && body.recent.length) {
+    recent = mergeRecent(body.recent, recent);
+    await setKV(env, 'recent', recent);
+  }
+  // keep the table small
+  await env.DB.prepare('DELETE FROM plays WHERE at < ?').bind(Date.now() - PLAYS_DAYS * 86400e3).run();
+  return json({ ok: true, recent });
 }
 
 async function putPlaylists(request, env) {

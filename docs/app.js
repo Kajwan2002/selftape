@@ -3,7 +3,7 @@ import * as api from './api.js';
 import { player } from './player.js';
 import { icon } from './icons.js';
 
-const APP_VERSION = 'v15'; // keep in sync with VERSION in sw.js
+const APP_VERSION = 'v16'; // keep in sync with VERSION in sw.js
 
 // ---------- helpers ----------
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -48,7 +48,7 @@ const state = {
   downloading: new Set(),
   playlists: { updatedAt: 0, items: [] },
   settings: { serverUrl: '', token: '', autoDownload: true, sort: 'new', libraryId: '', storageLimitMB: 1024 },
-  pending: { uploads: [], deletes: [], renames: [], playlistsDirty: false },
+  pending: { uploads: [], deletes: [], renames: [], playlistsDirty: false, plays: [], recentDirty: false },
   view: { name: 'library' },
   search: '',
   libTab: 'songs', // songs | artists
@@ -383,8 +383,44 @@ async function enforceStorageLimit(keepId) {
 function countPlay(id) {
   const t = state.tracks.get(id);
   if (!t) return;
-  t.plays = [...(t.plays || []), Date.now()].slice(-30);
+  const at = Date.now();
+  t.plays = [...(t.plays || []), at].slice(-30);
   db.put('tracks', t);
+  state.pending.plays = [...(state.pending.plays || []), { id, at }].slice(-500);
+  savePending();
+  scheduleHistoryPush();
+}
+
+// Send plays + "recently played" to the server (shared with your other devices).
+let historyTimer;
+function scheduleHistoryPush() {
+  clearTimeout(historyTimer);
+  historyTimer = setTimeout(pushHistory, 4000);
+}
+async function pushHistory() {
+  const p = state.pending;
+  if (!configured() || !navigator.onLine || (!p.plays?.length && !p.recentDirty)) return;
+  const plays = (p.plays || []).slice();
+  try {
+    const r = await api.postHistory(state.settings, { plays, recent: p.recentDirty ? state.recent : [] });
+    p.plays = (p.plays || []).slice(plays.length);
+    p.recentDirty = false;
+    await savePending();
+    if (Array.isArray(r.recent)) applyServerRecent(r.recent);
+  } catch {}
+}
+
+// Merge another device's "recently played" into ours (newest first, no duplicates).
+function applyServerRecent(list) {
+  const seen = new Set();
+  const merged = [...state.recent, ...list]
+    .sort((a, b) => b.at - a.at)
+    .filter((r) => { const k = `${r.type}:${r.id}`; if (seen.has(k)) return false; seen.add(k); return true; })
+    .slice(0, 12);
+  if (JSON.stringify(merged) === JSON.stringify(state.recent)) return;
+  state.recent = merged;
+  db.put('kv', state.recent, 'recent');
+  renderRecent();
 }
 
 function markPlayed(id) {
@@ -548,6 +584,7 @@ async function sync(manual = false) {
       await savePending();
       pushed = true;
     }
+    await pushHistory();
     if (p.playlistsDirty) {
       p.playlistsDirty = false;
       await api.savePlaylists(s, state.playlists);
@@ -580,6 +617,21 @@ async function sync(manual = false) {
     }
     state.lastSync = Date.now();
     state.telegram = lib.telegram || null;
+    // plays from all devices -> On repeat, After dark, Forgotten gems
+    if (lib.plays) {
+      for (const [id, list] of Object.entries(lib.plays)) {
+        const t = state.tracks.get(id);
+        if (!t) continue;
+        const merged = [...new Set([...(t.plays || []), ...list])].sort((a, b) => a - b).slice(-30);
+        const last = Math.max(t.lastPlayed || 0, merged[merged.length - 1] || 0);
+        if (merged.length !== (t.plays || []).length || last !== (t.lastPlayed || 0)) {
+          t.plays = merged;
+          t.lastPlayed = last;
+          await db.put('tracks', t);
+        }
+      }
+    }
+    if (Array.isArray(lib.recent)) applyServerRecent(lib.recent);
     if (lib.artistPhotos && JSON.stringify(lib.artistPhotos) !== JSON.stringify(state.artistPhotos)) {
       state.artistPhotos = lib.artistPhotos;
       db.put('kv', state.artistPhotos, 'artistPhotos');
@@ -1201,6 +1253,9 @@ function addRecent(item) {
   state.recent = [{ ...item, at: Date.now() }, ...state.recent.filter((r) => !(r.type === item.type && r.id === item.id))].slice(0, 12);
   db.put('kv', state.recent, 'recent');
   renderRecent();
+  state.pending.recentDirty = true;
+  savePending();
+  scheduleHistoryPush();
 }
 
 function recentEntries() {
