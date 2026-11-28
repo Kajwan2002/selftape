@@ -285,7 +285,7 @@ body.has-mini .view { padding-bottom: calc(var(--tabs-h) + var(--mini-h) + var(-
     repeating-radial-gradient(circle, #141416 0 1.5px, #1d1d20 1.5px 3px),
     #141416;
   box-shadow: 0 30px 60px -18px rgba(0, 0, 0, .75), inset 0 0 0 3px #0a0a0b, inset 0 0 0 5px #222226;
-  animation: vinyl-spin 3.2s linear infinite; animation-play-state: paused;
+  will-change: transform; /* turned by the app (see spinVinyl), not a CSS animation: iPhones kept resetting that */
 }
 /* light reflection: stays still while the record turns underneath */
 .turntable::before {
@@ -294,7 +294,6 @@ body.has-mini .view { padding-bottom: calc(var(--tabs-h) + var(--mini-h) + var(-
   background: conic-gradient(from 20deg, transparent 0 6%, rgba(255, 255, 255, .09) 11%, transparent 17%,
     transparent 50%, rgba(255, 255, 255, .07) 61%, transparent 67%);
 }
-.turntable.playing .vinyl { animation-play-state: running; }
 .vinyl .label.art {
   position: absolute; inset: 31%; width: auto; height: auto; border-radius: 50%;
   font-size: clamp(28px, 8vw, 48px); box-shadow: 0 0 0 2px rgba(0, 0, 0, .5);
@@ -311,8 +310,6 @@ body.has-mini .view { padding-bottom: calc(var(--tabs-h) + var(--mini-h) + var(-
   filter: drop-shadow(1px 2px 1.5px rgba(0, 0, 0, .5));
 }
 .turntable.playing .tonearm .arm { transform: rotate(0deg); }
-@keyframes vinyl-spin { to { transform: rotate(360deg); } }
-@media (prefers-reduced-motion: reduce) { .vinyl { animation: none; } }
 
 /* shown only on the old github.io address */
 .moved {

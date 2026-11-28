@@ -3,7 +3,7 @@ import * as api from './api.js';
 import { player } from './player.js';
 import { icon } from './icons.js';
 
-const APP_VERSION = 'v26'; // keep in sync with VERSION in sw.js
+const APP_VERSION = 'v27'; // keep in sync with VERSION in sw.js
 
 // ---------- helpers ----------
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -2014,6 +2014,7 @@ function renderPlayer() {
   const loading = player.loadingId === id;
   const playIcon = loading ? '<span class="spinner"></span>' : icon(player.playing ? 'pause' : 'play');
   $('#turntable').classList.toggle('playing', player.playing);
+  spinVinyl();
   const h = hue(t.id);
   paintArt($('#miniArt'), t);
   paintArt($('#pArt'), t);
@@ -2145,6 +2146,7 @@ function toggleLyrics(on = !lyricsShown) {
   $('#lyricsBtn').textContent = on ? 'Vinyl' : 'Lyrics';
   $('#lyricsBtn').classList.toggle('on', on);
   if (on) renderLyrics();
+  spinVinyl();
 }
 
 async function renderLyrics() {
@@ -2212,11 +2214,32 @@ function openPlayer() {
   const p = $('#player');
   p.classList.add('open');
   p.setAttribute('aria-hidden', 'false');
+  spinVinyl();
 }
 function closePlayer() {
   const p = $('#player');
   p.classList.remove('open');
   p.setAttribute('aria-hidden', 'true');
+  spinVinyl();
+}
+
+// The record turns once every 3.2 s while music plays and the player is open.
+// Done frame by frame (keeps its angle when paused, never snaps back).
+const SPIN_MS = 3200;
+const calmMotion = matchMedia('(prefers-reduced-motion: reduce)');
+let vinylAngle = 0;
+let spinFrame = 0;
+let spinLast = 0;
+function spinStep(ts) {
+  if (spinLast) vinylAngle = (vinylAngle + ((ts - spinLast) * 360) / SPIN_MS) % 360;
+  spinLast = ts;
+  $('#turntable .vinyl').style.transform = `rotate(${vinylAngle.toFixed(2)}deg)`;
+  spinFrame = requestAnimationFrame(spinStep);
+}
+function spinVinyl() {
+  const on = player.playing && !calmMotion.matches && !document.hidden && !lyricsShown && $('#player').classList.contains('open');
+  if (on && !spinFrame) { spinLast = 0; spinFrame = requestAnimationFrame(spinStep); }
+  else if (!on && spinFrame) { cancelAnimationFrame(spinFrame); spinFrame = 0; }
 }
 
 // ---------- sheets (menus, forms, pickers) ----------
@@ -2760,6 +2783,7 @@ function bindEvents() {
 
   player.addEventListener('change', renderPlayer);
   player.audio.addEventListener('timeupdate', renderTime);
+  document.addEventListener('visibilitychange', spinVinyl);
   player.audio.addEventListener('timeupdate', () => syncLyrics());
   player.audio.addEventListener('seeked', () => syncLyrics(true));
   player.addEventListener('change', () => {
