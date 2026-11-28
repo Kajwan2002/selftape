@@ -47,7 +47,7 @@
     <div class="player-inner">
       <div class="player-top">
         <button class="icon-btn" data-action="close-player" data-icon="chevron-down" aria-label="Close player"></button>
-        <span class="muted small">Now playing</span>
+        <button id="lyricsBtn" class="pill lyrics-toggle" data-action="toggle-lyrics">Lyrics</button>
         <button class="icon-btn" data-action="current-menu" data-icon="more" aria-label="Track options"></button>
       </div>
       <div id="turntable" class="turntable">
@@ -63,6 +63,7 @@
           <circle cx="112" cy="10" r="1.4" fill="#2a2a2e"/>
         </svg>
       </div>
+      <div id="lyrics" class="lyrics" hidden></div>
       <div class="p-meta"><div id="pTitle" class="p-title"></div><div id="pArtist" class="p-artist"></div></div>
       <input id="seek" class="seek" type="range" min="0" max="1000" value="0" aria-label="Seek">
       <div class="times"><span id="tCur">0:00</span><span id="tDur">0:00</span></div>

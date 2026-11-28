@@ -3,7 +3,7 @@ import * as api from './api.js';
 import { player } from './player.js';
 import { icon } from './icons.js';
 
-const APP_VERSION = 'v25'; // keep in sync with VERSION in sw.js
+const APP_VERSION = 'v26'; // keep in sync with VERSION in sw.js
 
 // ---------- helpers ----------
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -684,6 +684,7 @@ async function sync(manual = false) {
     loadDiscover();
     loadInspo();
     loadMoodLists();
+    setTimeout(fillLyrics, 20000);
     if (manual) toast('Synced');
   } catch (err) {
     state.syncError = err.message;
@@ -2062,6 +2063,151 @@ function renderTime() {
   }
 }
 
+// ---------- lyrics (from LRCLIB, a free lyrics database) ----------
+// Synced lyrics scroll with the song; tap a line to jump there. Saved on the
+// device after the first time, so they work offline too.
+const LYRICS_NONE_RETRY = 30 * 86400e3;
+const lyricsKey = (t) => `${t.title}|${t.artist || ''}`;
+const lyricsJobs = new Map();
+let lyricsShown = false;
+let lyricsFor = null; // { id, data }
+let lyricsLine = -1;
+let lyricsUserScroll = 0;
+
+function parseLRC(text) {
+  const out = [];
+  for (const raw of String(text || '').split(/\r?\n/)) {
+    const stamps = [...raw.matchAll(/\[(\d+):(\d+(?:\.\d+)?)\]/g)];
+    if (!stamps.length) continue;
+    const line = raw.replace(/\[[^\]]*\]/g, '').trim();
+    for (const m of stamps) out.push([Number(m[1]) * 60 + Number(m[2]), line]);
+  }
+  return out.sort((a, b) => a[0] - b[0]);
+}
+
+async function lrclib(path) {
+  const r = await fetch(`https://lrclib.net/api/${path}`);
+  if (r.status === 404) return null;
+  if (!r.ok) throw new Error('Lyrics service busy');
+  return r.json();
+}
+
+async function fetchLyrics(t) {
+  const title = t.title.replace(/\s*[([](feat|ft|with)\b.*?[)\]]/i, '').trim();
+  const artist = splitArtists(t.artist || '')[0] || '';
+  const q = (o) => new URLSearchParams(o).toString();
+  let hit = t.duration
+    ? await lrclib(`get?${q({ track_name: title, artist_name: artist, duration: Math.round(t.duration) })}`)
+    : null;
+  if (!hit?.syncedLyrics && !hit?.instrumental) {
+    let list = (artist && (await lrclib(`search?${q({ track_name: title, artist_name: artist })}`))) || [];
+    if (!list.length) list = (await lrclib(`search?${q({ q: `${title} ${artist}`.trim() })}`)) || [];
+    const ta = songKey(artist);
+    const fits = list.filter((x) => songKey(x.trackName) === songKey(title) || textSimilarity(songKey(x.trackName), songKey(title)) >= 0.8)
+      .filter((x) => !ta || textSimilarity(songKey(x.artistName), ta) >= 0.7 || songKey(x.artistName).includes(ta));
+    const score = (x) => (x.syncedLyrics ? 0 : 100) + (t.duration && x.duration ? Math.abs(x.duration - t.duration) : 30);
+    const best = fits.sort((a, b) => score(a) - score(b))[0];
+    if (best && (!hit || best.syncedLyrics)) hit = best;
+  }
+  return {
+    key: lyricsKey(t),
+    at: Date.now(),
+    synced: hit?.syncedLyrics ? parseLRC(hit.syncedLyrics) : [],
+    plain: hit?.plainLyrics || '',
+    instrumental: !!hit?.instrumental,
+  };
+}
+
+// Cached lyrics for a song, fetching them if needed (null = still unknown / offline).
+function getLyrics(id) {
+  const t = state.tracks.get(id);
+  if (!t) return Promise.resolve(null);
+  if (lyricsJobs.has(id)) return lyricsJobs.get(id);
+  const job = (async () => {
+    const cached = await db.get('kv', `lyrics:${id}`);
+    const empty = cached && !cached.synced.length && !cached.plain && !cached.instrumental;
+    if (cached && cached.key === lyricsKey(t) && !(empty && Date.now() - cached.at > LYRICS_NONE_RETRY)) return cached;
+    if (!navigator.onLine) return cached || null;
+    try {
+      const data = await fetchLyrics(t);
+      await db.put('kv', data, `lyrics:${id}`);
+      return data;
+    } catch { return cached || null; }
+  })().finally(() => lyricsJobs.delete(id));
+  lyricsJobs.set(id, job);
+  return job;
+}
+
+function toggleLyrics(on = !lyricsShown) {
+  lyricsShown = on;
+  $('#player').classList.toggle('show-lyrics', on);
+  $('#lyrics').hidden = !on;
+  $('#lyricsBtn').textContent = on ? 'Vinyl' : 'Lyrics';
+  $('#lyricsBtn').classList.toggle('on', on);
+  if (on) renderLyrics();
+}
+
+async function renderLyrics() {
+  const id = player.currentId;
+  const el = $('#lyrics');
+  if (!lyricsShown || !id) return;
+  if (lyricsFor?.id !== id) {
+    lyricsFor = { id, data: null };
+    lyricsLine = -1;
+    el.innerHTML = '<p class="lyrics-msg"><span class="spinner"></span></p>';
+    const data = await getLyrics(id);
+    if (player.currentId !== id) return;
+    lyricsFor = { id, data };
+    el.scrollTop = 0;
+  }
+  const d = lyricsFor.data;
+  if (!d) { el.innerHTML = `<p class="lyrics-msg">${navigator.onLine ? 'Couldn’t load lyrics right now' : 'Lyrics need internet the first time'}</p>`; return; }
+  if (d.synced.length) {
+    el.innerHTML = `<div class="lyrics-pad"></div>${d.synced.map(([time, line], i) =>
+      `<p class="lyr" data-action="lyric-seek" data-i="${i}" data-time="${time}">${esc(line) || '♪'}</p>`).join('')}<div class="lyrics-pad"></div>`;
+    lyricsLine = -1;
+    syncLyrics(true);
+  } else if (d.plain) {
+    el.innerHTML = `<div class="lyrics-plain">${esc(d.plain)}</div><p class="lyrics-msg small">These lyrics aren’t timed to the song</p>`;
+  } else {
+    el.innerHTML = `<p class="lyrics-msg">${d.instrumental ? 'Instrumental ♪' : 'No lyrics found for this song'}</p>`;
+  }
+}
+
+// Highlight the line being sung and keep it in the middle.
+function syncLyrics(jump = false) {
+  if (!lyricsShown || !lyricsFor?.data?.synced?.length || lyricsFor.id !== player.currentId) return;
+  const cur = player.isSilent ? 0 : player.audio.currentTime + 0.2;
+  const lines = lyricsFor.data.synced;
+  let i = -1;
+  for (let k = 0; k < lines.length && lines[k][0] <= cur; k++) i = k;
+  if (i === lyricsLine && !jump) return;
+  lyricsLine = i;
+  const el = $('#lyrics');
+  el.querySelectorAll('.lyr.on').forEach((p) => p.classList.remove('on'));
+  const p = i >= 0 ? el.querySelector(`.lyr[data-i="${i}"]`) : null;
+  if (p) p.classList.add('on');
+  if (Date.now() - lyricsUserScroll < 3500) return; // you're scrolling yourself
+  const target = p || el.querySelector('.lyr');
+  if (target) el.scrollTo({ top: target.offsetTop - el.clientHeight / 2 + target.clientHeight / 2, behavior: jump ? 'auto' : 'smooth' });
+}
+
+// Fetch lyrics for the whole library in the background, gently (once per app start).
+let lyricsFilling = false;
+async function fillLyrics() {
+  if (lyricsFilling || !navigator.onLine) return;
+  lyricsFilling = true;
+  try {
+    const have = new Set((await db.keys('kv')).filter((k) => String(k).startsWith('lyrics:')).map((k) => k.slice(7)));
+    const todo = [...state.tracks.values()].filter((t) => !have.has(t.id)).sort(newestFirst);
+    for (const t of todo) {
+      if (!navigator.onLine) break;
+      await getLyrics(t.id);
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+  } finally { lyricsFilling = false; }
+}
+
 function openPlayer() {
   const p = $('#player');
   p.classList.add('open');
@@ -2520,6 +2666,12 @@ function bindEvents() {
       case 'fix-missing': fixAllSongs({ onlyMissing: true }); break;
       case 'missing-info': showMissingInfo(); break;
       case 'open-player': openPlayer(); break;
+      case 'toggle-lyrics': toggleLyrics(); break;
+      case 'lyric-seek': {
+        const time = Number(el.dataset.time);
+        if (!player.isSilent && isFinite(time)) { player.audio.currentTime = Math.max(0, time - 0.05); lyricsUserScroll = 0; if (!player.playing) player.toggle(); syncLyrics(true); }
+        break;
+      }
       case 'close-player': closePlayer(); break;
       case 'toggle': player.toggle(); break;
       case 'next': player.next(); break;
@@ -2608,6 +2760,15 @@ function bindEvents() {
 
   player.addEventListener('change', renderPlayer);
   player.audio.addEventListener('timeupdate', renderTime);
+  player.audio.addEventListener('timeupdate', () => syncLyrics());
+  player.audio.addEventListener('seeked', () => syncLyrics(true));
+  player.addEventListener('change', () => {
+    if (lyricsShown && lyricsFor?.id !== player.currentId) renderLyrics();
+    const next = player.queue[player.index + 1]; // have the next song's lyrics ready
+    if (player.currentId) getLyrics(player.currentId).then(() => next && getLyrics(next));
+  });
+  const lyr = $('#lyrics');
+  for (const ev of ['wheel', 'touchmove']) lyr.addEventListener(ev, () => { lyricsUserScroll = Date.now(); }, { passive: true });
   player.audio.addEventListener('durationchange', renderTime);
   let countedFor = null;
   player.audio.addEventListener('timeupdate', () => {
