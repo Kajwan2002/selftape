@@ -217,26 +217,37 @@ async function discover(request) {
     for (const a of chosen) { used.add(a.id); picks.push({ because: b.name, artist: a }); }
   });
 
-  // 3) two popular songs from each
-  const tops = await Promise.all(picks.slice(0, 24).map((p) => deezer(`/artist/${p.artist.id}/top?limit=5`)));
+  // 3) two popular songs from each, plus popular songs by your own artists
+  //    (the app drops the ones you already have)
+  const [tops, ownTops] = await Promise.all([
+    Promise.all(picks.slice(0, 24).map((p) => deezer(`/artist/${p.artist.id}/top?limit=5`))),
+    Promise.all(bases.map((b) => deezer(`/artist/${b.id}/top?limit=25`))),
+  ]);
+  const toTrack = (t, fallbackArtist) => ({
+    id: String(t.id),
+    title: t.title_short || t.title,
+    artist: t.artist?.name || fallbackArtist,
+    cover: t.album?.cover_xl || t.album?.cover_big || t.album?.cover_medium || '',
+    duration: Number(t.duration) || 0,
+    link: t.link || '',
+  });
+  const more = bases.map((b, i) => ({
+    because: b.name,
+    kind: 'more',
+    tracks: (ownTops[i].data || []).filter((t) => t.preview && t.readable !== false && !hidden.has(String(t.id))).map((t) => toTrack(t, b.name)),
+  })).filter((g) => g.tracks.length);
   const groups = new Map();
   picks.slice(0, 24).forEach((p, i) => {
     const songs = (tops[i].data || []).filter((t) => t.preview && t.readable !== false && !hidden.has(String(t.id)));
     const two = songs.sort(() => rand() - 0.5).slice(0, 2);
     if (!groups.has(p.because)) groups.set(p.because, []);
     for (const t of two) {
-      groups.get(p.because).push({
-        id: String(t.id),
-        title: t.title_short || t.title,
-        artist: t.artist?.name || p.artist.name,
-        cover: t.album?.cover_xl || t.album?.cover_big || t.album?.cover_medium || '',
-        duration: Number(t.duration) || 0,
-        link: t.link || '',
-      });
+      groups.get(p.because).push(toTrack(t, p.artist.name));
     }
   });
   return json({
     groups: [...groups].map(([because, tracks]) => ({ because, tracks: tracks.sort(() => rand() - 0.5) })).filter((g) => g.tracks.length),
+    more,
   });
 }
 

@@ -3,7 +3,7 @@ import * as api from './api.js';
 import { player } from './player.js';
 import { icon } from './icons.js';
 
-const APP_VERSION = 'v28'; // keep in sync with VERSION in sw.js
+const APP_VERSION = 'v29'; // keep in sync with VERSION in sw.js
 
 // ---------- helpers ----------
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -1571,7 +1571,7 @@ function discoverSeeds() {
 
 async function loadDiscover(force = false) {
   if (!configured() || discoverLoading || !state.tracks.size || !navigator.onLine) return;
-  if (!force && state.discover?.day === todayKey() && state.discover.groups.length) return;
+  if (!force && state.discover?.day === todayKey() && state.discover.v === 2 && state.discover.groups.length) return;
   discoverLoading = true;
   if (force) toast('Finding new songs…');
   renderDiscoverRow();
@@ -1580,8 +1580,25 @@ async function loadDiscover(force = false) {
     const known = [...artists.values()].flatMap((a) => [...a.variants]);
     const r = await api.discover(state.settings, { seeds: discoverSeeds(), known, hidden: [...discoverHidden], day: force ? `${todayKey()}-${Date.now()}` : todayKey() });
     const have = new Set([...state.tracks.values()].map((t) => flatKey(t.title)));
-    const groups = (r.groups || []).map((g) => ({ ...g, tracks: g.tracks.filter((t) => !have.has(flatKey(t.title)) && !discoverHidden.has(t.id)) })).filter((g) => g.tracks.length);
-    state.discover = { day: todayKey(), groups, links: {} };
+    const fresh = (t) => !have.has(flatKey(t.title)) && !discoverHidden.has(t.id);
+    const similar = (r.groups || []).map((g) => ({ ...g, tracks: g.tracks.filter(fresh) })).filter((g) => g.tracks.length);
+    // "More from Radiohead": their popular songs you don't have yet (a few, changing daily)
+    const rnd = seeded(`${todayKey()}more${force ? Date.now() : ''}`);
+    const more = (r.more || []).map((g) => {
+      const seenT = new Set();
+      const list = g.tracks.filter(fresh).filter((t) => { const k = flatKey(t.title); if (seenT.has(k)) return false; seenT.add(k); return true; });
+      const top = list.slice(0, 4);
+      const rest = shuffleWith(list.slice(4), rnd).slice(0, 2);
+      return { ...g, tracks: [...top.slice(0, 3), ...rest, ...top.slice(3)].slice(0, 5) };
+    }).filter((g) => g.tracks.length);
+    // mix them: a "more from" section, then a "because you like" one, and so on
+    const groups = [];
+    for (let i = 0; i < Math.max(similar.length, more.length); i++) { if (more[i]) groups.push(more[i]); if (similar[i]) groups.push(similar[i]); }
+    // each song once on the page (no live versions / covers of the same title twice)
+    const shown = new Set();
+    for (const g of groups) g.tracks = g.tracks.filter((t) => { const k = flatKey(t.title); if (shown.has(k)) return false; shown.add(k); return true; });
+    for (let i = groups.length - 1; i >= 0; i--) if (!groups[i].tracks.length) groups.splice(i, 1);
+    state.discover = { v: 2, day: todayKey(), groups, links: {} };
     db.put('kv', state.discover, 'discover');
     if (force) toast(groups.length ? 'New picks ready' : 'No new songs found right now');
     refreshDiscover();
@@ -1633,7 +1650,7 @@ function discoverHTML() {
     </div>
     <div class="actions-row"><button class="pill" data-action="disc-refresh" ${discoverLoading ? 'disabled' : ''}>${icon('sync')} ${discoverLoading ? 'Finding songs…' : 'New picks'}</button></div>
     ${groups.length ? groups.map((g) => `
-      <h3 class="section-title disc-because">Because you like <b>${esc(g.because)}</b></h3>
+      <h3 class="section-title disc-because">${g.kind === 'more' ? 'More from' : 'Because you like'} <b>${esc(g.because)}</b></h3>
       <div class="list">${g.tracks.map((t) => `
         <div class="row disc-row" data-disc="${esc(t.id)}">
           <button class="disc-cover" data-action="disc-play" data-id="${esc(t.id)}" aria-label="Play preview" style="background-image:url('${esc(t.cover)}')"><span class="disc-play">${icon('play')}</span></button>
