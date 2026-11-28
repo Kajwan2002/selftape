@@ -55,6 +55,8 @@ async function route(request, env, ctx, url) {
   if (pathname === '/history' && method === 'POST') return postHistory(request, env);
   if (pathname === '/discover' && method === 'POST') return discover(request);
   if (pathname === '/discover/links' && method === 'POST') return discoverLinks(request);
+  if (pathname === '/inspo' && method === 'POST') return playlistInspo(request);
+  if (pathname === '/moods' && method === 'POST') return moodLists(request);
   if (pathname === '/telegram/setup' && method === 'POST') return setupTelegram(env, url);
   if (pathname === '/covers/find-missing' && method === 'POST') return findMissingCovers(env);
   if (pathname === '/genres/find-missing' && method === 'POST') return findMissingGenres(env);
@@ -236,6 +238,68 @@ async function discover(request) {
   return json({
     groups: [...groups].map(([because, tracks]) => ({ because, tracks: tracks.sort(() => rand() - 0.5) })).filter((g) => g.tracks.length),
   });
+}
+
+// Popular public playlists (from Deezer) for your artists, genres and moods,
+// with their song lists. The app rebuilds them out of your own songs.
+async function playlistInspo(request) {
+  const body = await request.json().catch(() => ({}));
+  const queries = (Array.isArray(body.queries) ? body.queries : []).map((q) => clean(q, 80)).filter(Boolean).slice(0, 9);
+  const seen = new Set();
+  const lists = [];
+  const results = await Promise.all(queries.map((q) => deezer(`/search/playlist?limit=6&q=${encodeURIComponent(q)}`)));
+  results.forEach((r, i) => {
+    const good = (r.data || [])
+      .filter((p) => !seen.has(p.id) && p.nb_tracks >= 15 && p.nb_tracks <= 400)
+      .slice(0, 3);
+    for (const p of good) { seen.add(p.id); lists.push({ id: String(p.id), title: clean(p.title, 80), query: queries[i], picture: p.picture_medium || '' }); }
+  });
+  const chosen = lists.slice(0, 27);
+  const tracks = await Promise.all(chosen.map((p) => deezer(`/playlist/${p.id}/tracks?limit=150`)));
+  return json({
+    playlists: chosen.map((p, i) => ({
+      ...p,
+      tracks: (tracks[i].data || []).map((t) => [t.title_short || t.title || '', t.artist?.name || '']).filter((x) => x[0]),
+    })).filter((p) => p.tracks.length >= 10),
+  });
+}
+
+// What real mood playlists ("sad songs", "rainy day"…) are made of: their
+// songs and how often each artist shows up. The app uses it to make its own
+// mood mixes feel like the ones on Spotify.
+async function moodLists(request) {
+  const body = await request.json().catch(() => ({}));
+  // each mood: one or two searches (e.g. "sad songs" and "sad songs rock" for your taste)
+  const moods = Object.entries(body.moods || {}).slice(0, 10)
+    .map(([id, q]) => [clean(id, 30), (Array.isArray(q) ? q : [q]).map((x) => clean(x, 60)).filter(Boolean).slice(0, 2)])
+    .filter(([id, qs]) => id && qs.length);
+  const searches = moods.flatMap(([id, qs]) => qs.map((q) => ({ id, q })));
+  const found = await Promise.all(searches.map(({ q }) => deezer(`/search/playlist?limit=12&q=${encodeURIComponent(q)}`)));
+  const jobs = [];
+  const editorial = (x) => (/deezer/i.test(x.user?.name || '') ? 0 : 1); // Deezer's own playlists first
+  for (const [id] of moods) {
+    const per = searches.map((x, i) => (x.id === id ? (found[i].data || []).filter((p) => p.nb_tracks >= 20).sort((a, b) => editorial(a) - editorial(b)) : null)).filter(Boolean);
+    const seen = new Set();
+    for (let k = 0; k < 4 && jobs.filter((j) => j.id === id).length < 3; k++) {
+      for (const list of per) {
+        const p = list[k];
+        if (p && !seen.has(p.id) && jobs.filter((j) => j.id === id).length < 3) { seen.add(p.id); jobs.push({ id, pid: p.id }); }
+      }
+    }
+  }
+  const lists = await Promise.all(jobs.slice(0, 40).map((j) => deezer(`/playlist/${j.pid}/tracks?limit=120`)));
+  const out = {};
+  jobs.slice(0, 40).forEach((j, i) => {
+    const tracks = lists[i].data || [];
+    const per = {};
+    for (const t of tracks) { const a = t.artist?.name || ''; if (a) per[a] = (per[a] || 0) + 1; }
+    if (!tracks.length || Math.max(0, ...Object.values(per)) > tracks.length * 0.25) return; // one-artist playlists say little about a mood
+    const m = (out[j.id] ||= { songs: [], artists: {}, lists: 0 });
+    m.lists++;
+    for (const t of tracks) m.songs.push([t.title_short || t.title || '', t.artist?.name || '']);
+    for (const a of Object.keys(per)) m.artists[a] = (m.artists[a] || 0) + 1; // = in how many playlists
+  });
+  return json({ moods: out });
 }
 
 // The preview links expire after a while, so get a fresh one each time.

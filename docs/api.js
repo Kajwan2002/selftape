@@ -67,6 +67,10 @@ export const discover = async (s, data) => (await call(s, '/discover', { method:
 export const discoverLinks = async (s, items) => (await call(s, '/discover/links', { method: 'POST', ...jsonBody({ items }) })).json();
 export const previewUrl = (s, id) => `${base(s)}/discover/preview/${id}`;
 
+export const playlistInspo = async (s, queries) => (await call(s, '/inspo', { method: 'POST', ...jsonBody({ queries }) })).json();
+
+export const moodLists = async (s, moods) => (await call(s, '/moods', { method: 'POST', ...jsonBody({ moods }) })).json();
+
 export const postHistory = async (s, data, keepalive = false) =>
   (await call(s, '/history', { method: 'POST', keepalive, ...jsonBody(data) })).json();
 

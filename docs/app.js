@@ -3,7 +3,7 @@ import * as api from './api.js';
 import { player } from './player.js';
 import { icon } from './icons.js';
 
-const APP_VERSION = 'v23'; // keep in sync with VERSION in sw.js
+const APP_VERSION = 'v25'; // keep in sync with VERSION in sw.js
 
 // ---------- helpers ----------
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -682,6 +682,8 @@ async function sync(manual = false) {
     else analyzeLibrary();
     fillGenres();
     loadDiscover();
+    loadInspo();
+    loadMoodLists();
     if (manual) toast('Synced');
   } catch (err) {
     state.syncError = err.message;
@@ -1186,7 +1188,7 @@ const today = () => new Date().toISOString().slice(0, 10);
 let mixCache = { key: '', mixes: [] };
 function computeMixes() {
   const all = [...state.tracks.values()];
-  const key = `${today()}|${Math.floor(new Date().getHours() / 2)}|${all.length}|${all.filter((t) => t.features && !t.features.failed).length}|${all.reduce((n, t) => n + (t.plays?.length || 0), 0)}|${all.map((t) => t.genre || '').join(',').length}`;
+  const key = `${today()}|${state.inspo?.day || ''}|${state.moodLists?.at || 0}|${state.inspo?.playlists?.length || 0}|${Math.floor(new Date().getHours() / 2)}|${all.length}|${all.filter((t) => t.features && !t.features.failed).length}|${all.reduce((n, t) => n + (t.plays?.length || 0), 0)}|${all.map((t) => t.genre || '').join(',').length}`;
   if (mixCache.key.startsWith(key + '|')) return mixCache.mixes;
   const day = today();
   const mixes = [];
@@ -1212,7 +1214,7 @@ function computeMixes() {
   const hour = new Date().getHours();
   const analyzed = all.filter((t) => t.features && !t.features.failed);
   const timeFirst = new Set(); // mixes that fit the current time of day go first
-  if (analyzed.length >= 8) {
+  if (analyzed.length >= 8 || state.moodLists) {
     const pct = (field) => {
       const sorted = analyzed.map((t) => t.features[field]).sort((a, b) => a - b);
       return (v) => sorted.findIndex((x) => x >= v) / Math.max(1, sorted.length - 1);
@@ -1268,8 +1270,15 @@ function computeMixes() {
     const inHours = (h, [a, b]) => (a <= b ? h >= a && h < b : h >= a || h < b);
     for (const m of MOODS) {
       // the best ~30% of your library for this mood, if they really fit
-      const ranked = rows.map((r) => ({ id: r.t.id, sc: m.score(r) })).sort((a, b) => b.sc - a.sc);
-      const cut = Math.max(5, Math.ceil(rows.length * 0.3));
+      // what it hears in the song + how often its song/artist shows up in real
+      // playlists for this mood (songs not analysed yet can get in on that alone)
+      const sig = moodSignal(m.id);
+      const heard = new Set(rows.map((r) => r.t.id));
+      const ranked = [
+        ...(analyzed.length >= 8 ? rows.map((r) => ({ id: r.t.id, sc: m.score(r) + sig(r.t) * 1.2 })) : []),
+        ...all.filter((t) => analyzed.length < 8 || !heard.has(t.id)).map((t) => { const x = sig(t); return { id: t.id, sc: x >= 0.5 ? 0.9 + x : -9 }; }),
+      ].sort((a, b) => b.sc - a.sc);
+      const cut = Math.max(5, Math.ceil(all.length * 0.3));
       const ids = ranked.slice(0, cut).filter((x) => x.sc >= 0.9).map((x) => x.id);
       add(m.id, m.name, m.desc, shuffleWith(ids, seeded(day + m.id)), m.hue);
       if (m.hours && inHours(hour, m.hours)) timeFirst.add(m.id);
@@ -1305,12 +1314,190 @@ function computeMixes() {
     add(`artist:${a.key}`, `${a.name} mix`, `Songs by ${a.name}`, shuffleWith(a.ids, seeded(day + a.key)), hue(a.key), 4);
   }
 
+  // Played together: songs you usually listen to in the same sitting
+  for (const mx of playedTogetherMixes(all)) add(mx.id, mx.name, mx.desc, mx.ids, mx.hue);
+
+  // Inspired by popular playlists on other apps, rebuilt from your songs
+  for (const mx of inspoMixes(all)) add(mx.id, mx.name, mx.desc, mx.ids, mx.hue);
+
   const shuffledMixes = shuffleWith(mixes, seeded(`${day}order`));
   mixCache = { key: key + '|' + [...timeFirst].join(','), mixes: [...shuffledMixes.filter((m) => timeFirst.has(m.id)), ...shuffledMixes.filter((m) => !timeFirst.has(m.id))] };
   return mixCache.mixes;
 }
 
 const findMix = (id) => computeMixes().find((m) => m.id === id);
+
+const overlap = (a, b) => { const s = new Set(b); return a.filter((x) => s.has(x)).length / Math.max(1, Math.min(a.length, b.length)); };
+
+// Songs you usually play in the same sitting (plays less than 40 min apart).
+function playedTogetherMixes(all) {
+  const plays = all.flatMap((t) => (t.plays || []).map((at) => ({ id: t.id, at }))).sort((a, b) => a.at - b.at);
+  const sessions = [];
+  let cur = [];
+  for (let i = 0; i < plays.length; i++) {
+    if (i && plays[i].at - plays[i - 1].at > 40 * 60e3) { sessions.push(cur); cur = []; }
+    cur.push(plays[i].id);
+  }
+  sessions.push(cur);
+  const pair = new Map(); // id -> Map(otherId -> sessions together)
+  const count = new Map();
+  for (const sess of sessions) {
+    const ids = [...new Set(sess)];
+    if (ids.length < 2 || ids.length > 60) continue;
+    for (const a of ids) {
+      count.set(a, (count.get(a) || 0) + 1);
+      const m = pair.get(a) || pair.set(a, new Map()).get(a);
+      for (const b of ids) if (a !== b) m.set(b, (m.get(b) || 0) + 1);
+    }
+  }
+  const out = [];
+  const seeds = [...count].filter(([, n]) => n >= 2).sort((a, b) => b[1] - a[1]).map(([id]) => id);
+  for (const seed of seeds) {
+    const partners = [...(pair.get(seed) || [])].filter(([, n]) => n >= 2).sort((a, b) => b[1] - a[1]).map(([id]) => id);
+    const ids = [seed, ...partners].slice(0, 30);
+    if (ids.length < 5 || out.some((m) => overlap(m.ids, ids) > 0.5)) continue;
+    const t = state.tracks.get(seed);
+    out.push({ id: `together:${seed}`, name: out.length ? `${t.title} & co.` : 'Played together', desc: `Songs you usually play with “${t.title}”`, ids, hue: 310 + out.length * 20 });
+    if (out.length >= 2) break;
+  }
+  return out;
+}
+
+// ---------- mood mixes that learn from real mood playlists ----------
+const MOOD_QUERIES = {
+  gym: 'gym workout', chill: 'chill vibes', sad: 'sad songs', happy: 'feel good', drive: 'late night drive',
+  hype: 'pump up songs', focus: 'deep focus', rain: 'rainy day', morning: 'morning coffee',
+};
+state.moodLists = null; // { at, moods: { id: { songs: Set-able [[t, a]], artists: { name: count } } } }
+let moodLoading = false;
+async function loadMoodLists() {
+  if (!configured() || moodLoading || !navigator.onLine) return;
+  if (state.moodLists && Date.now() - state.moodLists.at < 7 * 86400e3 && state.tracks.size < (state.moodLists.size || 0) * 1.25 + 10) return; // weekly, or when your library grew a lot
+  moodLoading = true;
+  try {
+    // search each mood plainly and in your favourite genre ("sad songs" + "sad songs rock")
+    const fams = new Map();
+    for (const t of state.tracks.values()) { const f = genreFamily(t.genre); if (f) fams.set(f, (fams.get(f) || 0) + 1); }
+    const fav = [...fams].sort((a, b) => b[1] - a[1])[0]?.[0] || '';
+    const queries = Object.fromEntries(Object.entries(MOOD_QUERIES).map(([id, q]) => [id, fav ? [`${q} ${fav.toLowerCase()}`, q] : [q]]));
+    const r = await api.moodLists(state.settings, queries);
+    if (!r.moods || !Object.keys(r.moods).length) return;
+    state.moodLists = { at: Date.now(), size: state.tracks.size, moods: r.moods };
+    db.put('kv', state.moodLists, 'moodLists');
+    moodSignals = null;
+    mixCache.key = '';
+    renderMixes();
+  } catch {} finally { moodLoading = false; }
+}
+
+// 0..1: how much a song belongs in this mood according to real playlists.
+// Exact song in them = 1; otherwise how often its artist shows up there.
+let moodSignals = null;
+function moodSignal(id) {
+  const m = state.moodLists?.moods?.[id];
+  if (!m) return () => 0;
+  moodSignals ||= {};
+  if (!moodSignals[id]) {
+    const songs = new Set(m.songs.map(([t, a]) => `${songKey(t)}|${firstArtistKey(a)}`));
+    const counts = new Map();
+    for (const [a, n] of Object.entries(m.artists)) { const k = songKey(a); counts.set(k, (counts.get(k) || 0) + n); }
+    const top = Math.max(1, ...counts.values());
+    moodSignals[id] = (t) => {
+      const artists = splitArtists(t.artist || '').map(songKey);
+      if (artists.some((a) => songs.has(`${songKey(t.title)}|${a}`))) return 1;
+      let best = 0;
+      for (const a of artists) { const n = counts.get(a) || 0; if (n) best = Math.max(best, n >= 2 ? 0.3 + 0.3 * Math.sqrt(n / top) : 0.15); }
+      return Math.min(0.6, best); // the artist fits; the song itself still has to sound right
+    };
+  }
+  return moodSignals[id];
+}
+
+// ---------- playlist ideas from other apps ----------
+// Popular public playlists (Deezer's catalogue, the same kind of playlists you
+// see on Spotify / Apple Music) for your artists, genres and moods. Each one is
+// rebuilt from songs you already have; it's only suggested if enough of yours fit.
+state.inspo = null; // { day, playlists: [{ id, title, query, tracks: [[title, artist]] }] }
+let inspoLoading = false;
+const songKey = (s) => String(s || '').toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+  .replace(/\(.*?\)|\[.*?\]/g, '').replace(/\s-\s.*$/, '').replace(/[^\p{L}\p{N}]+/gu, '');
+const firstArtistKey = (a) => songKey(splitArtists(a || '')[0] || a);
+
+async function loadInspo() {
+  if (!configured() || inspoLoading || state.tracks.size < 8 || !navigator.onLine) return;
+  if (state.inspo?.day === todayKey()) return;
+  inspoLoading = true;
+  try {
+    const rnd = seeded(`${todayKey()}inspo`);
+    const fams = new Map();
+    for (const t of state.tracks.values()) { const f = genreFamily(t.genre); if (f) fams.set(f, (fams.get(f) || 0) + 1); }
+    const topFams = [...fams].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([f]) => f);
+    const flavours = ['classics', 'hits', 'essentials', 'anthems', '90s', '80s', '2000s'];
+    const moods = ['chill', 'workout', 'road trip', 'sad songs', 'party', 'late night', 'summer', 'love songs', 'feel good', 'focus'];
+    const queries = [
+      ...discoverSeeds().slice(0, 3),
+      ...topFams.map((f) => `${f} ${flavours[Math.floor(rnd() * flavours.length)]}`),
+      ...shuffleWith(moods, rnd).slice(0, 3).map((m) => (topFams[0] && rnd() < 0.5 ? `${m} ${topFams[0]}` : m)),
+    ];
+    const r = await api.playlistInspo(state.settings, queries);
+    state.inspo = { day: todayKey(), playlists: r.playlists || [] };
+    db.put('kv', state.inspo, 'inspo');
+    mixCache.key = '';
+    renderMixes();
+  } catch {} finally { inspoLoading = false; }
+}
+
+const tidyTitle = (s) => {
+  let t = String(s || '').replace(/[\p{Extended_Pictographic}\uFE0F]/gu, '').split(/\s[|/:–-]\s|\s\/|:\s/)[0].replace(/\s+/g, ' ').trim();
+  if (t === t.toUpperCase()) t = t.toLowerCase().replace(/\b\p{L}/gu, (c) => c.toUpperCase());
+  return t.slice(0, 40);
+};
+
+function inspoMixes(all) {
+  const lists = state.inspo?.playlists || [];
+  if (!lists.length) return [];
+  const byTitle = new Map();
+  const byArtist = new Map();
+  for (const t of all) {
+    const k = songKey(t.title);
+    if (k) (byTitle.get(k) || byTitle.set(k, []).get(k)).push(t);
+    for (const a of splitArtists(t.artist || '')) { const ak = songKey(a); if (ak) (byArtist.get(ak) || byArtist.set(ak, []).get(ak)).push(t.id); }
+  }
+  const cands = [];
+  const usedNames = new Set();
+  for (const p of lists) {
+    const exact = new Set();
+    const plArtists = new Map(); // artist key -> how many songs in the playlist
+    for (const [title, artist] of p.tracks) {
+      const ak = firstArtistKey(artist);
+      plArtists.set(ak, (plArtists.get(ak) || 0) + 1);
+      for (const t of byTitle.get(songKey(title)) || []) {
+        const mine = splitArtists(t.artist || '').map(songKey);
+        if (!ak || mine.some((m) => m === ak || m.includes(ak) || ak.includes(m) || textSimilarity(m, ak) >= 0.8)) exact.add(t.id);
+      }
+    }
+    // plus your other songs by artists the playlist features (a few each)
+    const extra = [];
+    for (const [ak, n] of [...plArtists].sort((a, b) => b[1] - a[1])) {
+      const ids = (byArtist.get(ak) || []).filter((id) => !exact.has(id));
+      extra.push(...shuffleWith(ids, seeded(p.id + ak)).slice(0, n >= 3 ? 3 : 2));
+    }
+    const ids = [...new Set([...exact, ...extra])].slice(0, 30);
+    const artists = new Set(ids.map((id) => firstArtistKey(state.tracks.get(id)?.artist)));
+    if (ids.length < 6 || artists.size < 2 || (exact.size < 2 && artists.size < 3)) continue;
+    const name = tidyTitle(p.title);
+    if (!name || usedNames.has(name.toLowerCase())) continue;
+    cands.push({ p, name, ids, score: exact.size * 3 + ids.length + artists.size });
+  }
+  const out = [];
+  for (const c of cands.sort((a, b) => b.score - a.score)) {
+    if (out.some((m) => overlap(m.ids, c.ids) > 0.6) || usedNames.has(c.name.toLowerCase())) continue;
+    usedNames.add(c.name.toLowerCase());
+    out.push({ id: `inspo:${c.p.id}`, name: c.name, desc: `Your songs, inspired by the popular “${c.p.title}” playlist`, ids: shuffleWith(c.ids, seeded(todayKey() + c.p.id)), hue: hue(c.name) });
+    if (out.length >= 6) break;
+  }
+  return out;
+}
 
 function mixArt(mx, cls = '') {
   const ids = [...new Set(mx.ids)].filter((id) => state.tracks.get(id)?.cover).slice(0, 4);
@@ -2484,6 +2671,8 @@ async function init() {
   if (Array.isArray(recent)) state.recent = recent;
   state.artistPhotos = (await db.get('kv', 'artistPhotos')) || {};
   state.discover = (await db.get('kv', 'discover')) || null;
+  state.inspo = (await db.get('kv', 'inspo')) || null;
+  state.moodLists = (await db.get('kv', 'moodLists')) || null;
   discoverHidden = new Set((await db.get('kv', 'discoverHidden')) || []);
   tracks.forEach((t) => state.tracks.set(t.id, t));
   state.downloaded = new Set(blobKeys);
