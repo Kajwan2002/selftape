@@ -43,12 +43,18 @@ async function route(request, env, ctx, url) {
   if (pathname === '/' && method === 'GET') return new Response('Selftape API is running.');
   if (pathname === '/telegram' && method === 'POST') return telegramWebhook(request, env, ctx);
 
+  // 30-second song previews (public: the audio player can't send the password)
+  const pv = pathname.match(/^\/discover\/preview\/(\d{1,15})$/);
+  if (pv && method === 'GET') return previewRedirect(pv[1]);
+
   if (!env.APP_TOKEN) return json({ error: 'APP_TOKEN is not set on the server' }, 500);
   if (!(await authorized(request, env))) return json({ error: 'Wrong app password' }, 401);
 
   if (pathname === '/library' && method === 'GET') return getLibrary(env);
   if (pathname === '/playlists' && method === 'PUT') return putPlaylists(request, env);
   if (pathname === '/history' && method === 'POST') return postHistory(request, env);
+  if (pathname === '/discover' && method === 'POST') return discover(request);
+  if (pathname === '/discover/links' && method === 'POST') return discoverLinks(request);
   if (pathname === '/telegram/setup' && method === 'POST') return setupTelegram(env, url);
   if (pathname === '/covers/find-missing' && method === 'POST') return findMissingCovers(env);
   if (pathname === '/genres/find-missing' && method === 'POST') return findMissingGenres(env);
@@ -169,6 +175,92 @@ async function getLibrary(env) {
     artistPhotos: await getKV(env, 'artistPhotos', {}), // artist key -> photo url ('' = checked, none)
     ...(await getHistory(env)),
   });
+}
+
+// ---------- discover: new songs like the ones you play ----------
+// For each of your favourite artists, Deezer's "similar artists" and their
+// most popular songs. Everything plays as an official 30-second preview.
+const deezer = (path) => fetch(`https://api.deezer.com${path}`).then((r) => r.json()).catch(() => ({}));
+
+function dayRandom(seed) {
+  let h = 2166136261;
+  for (const c of seed) h = Math.imul(h ^ c.charCodeAt(0), 16777619);
+  return () => { h = Math.imul(h ^ (h >>> 15), 2246822507); h = Math.imul(h ^ (h >>> 13), 3266489909); return ((h ^= h >>> 16) >>> 0) / 4294967296; };
+}
+
+async function discover(request) {
+  const body = await request.json().catch(() => ({}));
+  const seeds = (Array.isArray(body.seeds) ? body.seeds : []).map((x) => clean(x, 120)).filter(Boolean).slice(0, 6);
+  const known = new Set((Array.isArray(body.known) ? body.known : []).map((x) => norm(x)).filter(Boolean));
+  const hidden = new Set((Array.isArray(body.hidden) ? body.hidden : []).map(String));
+  const rand = dayRandom(String(body.day || new Date().toISOString().slice(0, 10)));
+  const isKnown = (name) => { const n = norm(name); return known.has(n) || [...known].some((k) => k.length >= 6 && similarity(k, n) >= 0.85); };
+
+  // 1) find your artists on Deezer
+  const found = await Promise.all(seeds.map(async (name) => {
+    const r = await deezer(`/search/artist?limit=3&q=${encodeURIComponent(name)}`);
+    const a = (r.data || []).find((x) => similarity(norm(x.name), norm(name)) >= 0.75);
+    return a ? { name, id: a.id } : null;
+  }));
+  const bases = found.filter(Boolean);
+
+  // 2) their similar artists you don't have yet (each only once)
+  const used = new Set();
+  const picks = [];
+  const related = await Promise.all(bases.map((b) => deezer(`/artist/${b.id}/related?limit=12`)));
+  bases.forEach((b, i) => {
+    const list = (related[i].data || []).filter((a) => !used.has(a.id) && !isKnown(a.name));
+    // mostly the closest matches, plus one a bit further out
+    const chosen = [...list.slice(0, 3), ...(list.length > 3 ? [list[3 + Math.floor(rand() * (list.length - 3))]] : [])].slice(0, 4);
+    for (const a of chosen) { used.add(a.id); picks.push({ because: b.name, artist: a }); }
+  });
+
+  // 3) two popular songs from each
+  const tops = await Promise.all(picks.slice(0, 24).map((p) => deezer(`/artist/${p.artist.id}/top?limit=5`)));
+  const groups = new Map();
+  picks.slice(0, 24).forEach((p, i) => {
+    const songs = (tops[i].data || []).filter((t) => t.preview && t.readable !== false && !hidden.has(String(t.id)));
+    const two = songs.sort(() => rand() - 0.5).slice(0, 2);
+    if (!groups.has(p.because)) groups.set(p.because, []);
+    for (const t of two) {
+      groups.get(p.because).push({
+        id: String(t.id),
+        title: t.title_short || t.title,
+        artist: t.artist?.name || p.artist.name,
+        cover: t.album?.cover_xl || t.album?.cover_big || t.album?.cover_medium || '',
+        duration: Number(t.duration) || 0,
+        link: t.link || '',
+      });
+    }
+  });
+  return json({
+    groups: [...groups].map(([because, tracks]) => ({ because, tracks: tracks.sort(() => rand() - 0.5) })).filter((g) => g.tracks.length),
+  });
+}
+
+// The preview links expire after a while, so get a fresh one each time.
+async function previewRedirect(id) {
+  const t = await deezer(`/track/${id}`);
+  if (!t.preview) return new Response('No preview', { status: 404 });
+  return Response.redirect(t.preview, 302);
+}
+
+// Apple Music links for a list of songs (so the button opens the right song).
+async function discoverLinks(request) {
+  const body = await request.json().catch(() => ({}));
+  const items = (Array.isArray(body.items) ? body.items : []).slice(0, 20);
+  const links = {};
+  await Promise.all(items.map(async (it) => {
+    const title = clean(it.title, 200);
+    const artist = clean(it.artist, 200);
+    if (!it.id || !title) return;
+    try {
+      const r = await fetch(`https://itunes.apple.com/search?media=music&entity=song&limit=5&term=${encodeURIComponent(`${artist} ${title}`)}`).then((x) => x.json());
+      const hit = (r.results || []).find((x) => similarity(norm(x.trackName), norm(title)) >= 0.7 && similarity(norm(x.artistName), norm(artist)) >= 0.6);
+      if (hit?.trackViewUrl) links[String(it.id)] = hit.trackViewUrl.replace(/[?&]uo=\d+/, '');
+    } catch {}
+  }));
+  return json({ links });
 }
 
 // ---------- listening history (shared by all your devices) ----------

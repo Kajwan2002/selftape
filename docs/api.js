@@ -63,6 +63,10 @@ export const findMissingGenres = async (s) => (await call(s, '/genres/find-missi
 
 export const deleteTrack = (s, id) => call(s, `/tracks/${id}`, { method: 'DELETE' });
 
+export const discover = async (s, data) => (await call(s, '/discover', { method: 'POST', ...jsonBody(data) })).json();
+export const discoverLinks = async (s, items) => (await call(s, '/discover/links', { method: 'POST', ...jsonBody({ items }) })).json();
+export const previewUrl = (s, id) => `${base(s)}/discover/preview/${id}`;
+
 export const postHistory = async (s, data, keepalive = false) =>
   (await call(s, '/history', { method: 'POST', keepalive, ...jsonBody(data) })).json();
 

@@ -3,7 +3,7 @@ import * as api from './api.js';
 import { player } from './player.js';
 import { icon } from './icons.js';
 
-const APP_VERSION = 'v21'; // keep in sync with VERSION in sw.js
+const APP_VERSION = 'v22'; // keep in sync with VERSION in sw.js
 
 // ---------- helpers ----------
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -681,6 +681,7 @@ async function sync(manual = false) {
     if (s.autoDownload) backgroundDownload().then(analyzeLibrary);
     else analyzeLibrary();
     fillGenres();
+    loadDiscover();
     if (manual) toast('Synced');
   } catch (err) {
     state.syncError = err.message;
@@ -700,7 +701,7 @@ function render() {
 }
 
 function renderTabs() {
-  const active = state.view.name === 'playlist' ? 'playlists' : ['artist', 'mix'].includes(state.view.name) ? 'library' : state.view.name;
+  const active = state.view.name === 'playlist' ? 'playlists' : ['artist', 'mix', 'discover'].includes(state.view.name) ? 'library' : state.view.name;
   $('#importBtn').hidden = state.view.name !== 'library';
   $$('.tabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === active));
 }
@@ -724,6 +725,10 @@ function renderView() {
     el.innerHTML = mixHTML(mix);
     hydrateCovers(el);
     renderList();
+  } else if (v.name === 'discover') {
+    $('#pageTitle').textContent = 'Library';
+    el.innerHTML = discoverHTML();
+    if (!state.discover?.groups?.length) loadDiscover();
   } else if (v.name === 'artist') {
     const a = artistIndex().get(v.key);
     if (!a) { state.view = { name: 'library' }; state.libTab = 'artists'; return renderView(); }
@@ -763,6 +768,7 @@ function libraryHTML() {
       <button data-action="lib-tab" data-lib="songs" class="${songs ? 'on' : ''}">Songs</button>
       <button data-action="lib-tab" data-lib="artists" class="${songs ? '' : 'on'}">Artists</button>
     </div>
+    <div id="discover"></div>
     <div id="mixes"></div>
     <div id="recent"></div>
     ${songs ? `<div class="actions-row">
@@ -1355,6 +1361,153 @@ async function saveMix(mx) {
   renderView();
 }
 
+// ---------- discover: new songs like the ones you play ----------
+// Songs you don't have yet by artists similar to your favourites, as official
+// 30-second previews. Like one? Open it in Spotify or Apple Music and save it there.
+state.discover = null; // { day, groups: [{ because, tracks }], links: { id: appleUrl } }
+let discoverHidden = new Set();
+let discoverLoading = false;
+const todayKey = () => new Date().toISOString().slice(0, 10);
+const flatKey = (s) => String(s || '').toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/\(.*?\)|\[.*?\]/g, '').replace(/[^\p{L}\p{N}]+/gu, '');
+const discoverTracks = () => (state.discover?.groups || []).flatMap((g) => g.tracks);
+
+// Your favourite artists: the ones you play most (recent plays count more), then the ones you have most songs by.
+function discoverSeeds() {
+  const now = Date.now();
+  const scored = [...artistIndex().values()].map((a) => {
+    let score = a.ids.length * 0.5;
+    for (const id of a.ids) for (const at of state.tracks.get(id)?.plays || []) score += Math.max(0.2, 1 - (now - at) / (60 * 86400e3));
+    return { name: a.name, score };
+  }).sort((x, y) => y.score - x.score);
+  return scored.slice(0, 6).map((x) => x.name);
+}
+
+async function loadDiscover(force = false) {
+  if (!configured() || discoverLoading || !state.tracks.size || !navigator.onLine) return;
+  if (!force && state.discover?.day === todayKey() && state.discover.groups.length) return;
+  discoverLoading = true;
+  if (force) toast('Finding new songs…');
+  renderDiscoverRow();
+  try {
+    const artists = artistIndex();
+    const known = [...artists.values()].flatMap((a) => [...a.variants]);
+    const r = await api.discover(state.settings, { seeds: discoverSeeds(), known, hidden: [...discoverHidden], day: force ? `${todayKey()}-${Date.now()}` : todayKey() });
+    const have = new Set([...state.tracks.values()].map((t) => flatKey(t.title)));
+    const groups = (r.groups || []).map((g) => ({ ...g, tracks: g.tracks.filter((t) => !have.has(flatKey(t.title)) && !discoverHidden.has(t.id)) })).filter((g) => g.tracks.length);
+    state.discover = { day: todayKey(), groups, links: {} };
+    db.put('kv', state.discover, 'discover');
+    if (force) toast(groups.length ? 'New picks ready' : 'No new songs found right now');
+    refreshDiscover();
+    // Apple Music links, so that button opens the exact song
+    const all = discoverTracks();
+    for (let i = 0; i < all.length; i += 20) {
+      const { links } = await api.discoverLinks(state.settings, all.slice(i, i + 20).map(({ id, title, artist }) => ({ id, title, artist })));
+      Object.assign(state.discover.links, links);
+    }
+    db.put('kv', state.discover, 'discover');
+    if (state.view.name === 'discover') refreshDiscover();
+  } catch (err) {
+    if (force) toast(err.message);
+  } finally {
+    discoverLoading = false;
+    refreshDiscover();
+  }
+}
+
+function refreshDiscover() {
+  if (state.view.name === 'discover') { const y = window.scrollY; $('#view').innerHTML = discoverHTML(); window.scrollTo(0, y); paintPreview(); }
+  else renderDiscoverRow();
+}
+
+function renderDiscoverRow() {
+  const el = $('#discover');
+  if (!el) return;
+  const groups = state.libTab === 'songs' && !state.search ? state.discover?.groups || [] : [];
+  // one from each "because you like", round-robin, so the row is varied
+  const picks = [];
+  for (let i = 0; picks.length < 12 && groups.some((g) => g.tracks[i]); i++) for (const g of groups) if (g.tracks[i] && picks.length < 12) picks.push(g.tracks[i]);
+  el.innerHTML = picks.length
+    ? `<div class="section-head"><h3 class="section-title">Discover new music</h3><button class="link" data-action="open-discover">See all</button></div>
+      <div class="recent-row">${picks.map((t) => `<button class="recent-item" data-action="open-discover" data-id="${esc(t.id)}">
+        <div class="art disc-art" style="background-image:url('${esc(t.cover)}')"><span class="disc-play">${icon('play')}</span></div>
+        <span class="t">${esc(t.title)}</span><span class="s">${esc(t.artist)}</span></button>`).join('')}</div>`
+    : '';
+}
+
+const spotifyUrl = (t) => `https://open.spotify.com/search/${encodeURIComponent(`${t.title} ${t.artist}`)}`;
+const appleUrl = (t) => state.discover?.links?.[t.id] || `https://music.apple.com/search?term=${encodeURIComponent(`${t.title} ${t.artist}`)}`;
+
+function discoverHTML() {
+  const groups = state.discover?.groups || [];
+  return `
+    <button class="back" data-action="back-library">${icon('chevron-left')} Library</button>
+    <div class="pl-head disc-head">
+      <div class="meta"><h2>Discover</h2>
+        <div class="muted small">Songs you don't have yet, picked from what you listen to. Tap to hear 30 seconds — like it? Save it in Spotify or Apple Music. New picks every day.</div></div>
+    </div>
+    <div class="actions-row"><button class="pill" data-action="disc-refresh" ${discoverLoading ? 'disabled' : ''}>${icon('sync')} ${discoverLoading ? 'Finding songs…' : 'New picks'}</button></div>
+    ${groups.length ? groups.map((g) => `
+      <h3 class="section-title disc-because">Because you like <b>${esc(g.because)}</b></h3>
+      <div class="list">${g.tracks.map((t) => `
+        <div class="row disc-row" data-disc="${esc(t.id)}">
+          <button class="disc-cover" data-action="disc-play" data-id="${esc(t.id)}" aria-label="Play preview" style="background-image:url('${esc(t.cover)}')"><span class="disc-play">${icon('play')}</span></button>
+          <div class="meta"><div class="t">${esc(t.title)}</div><div class="s">${esc(t.artist)}</div>
+            <div class="disc-links">
+              <a class="mini-pill spotify" href="${esc(spotifyUrl(t))}" target="_blank" rel="noopener">Spotify</a>
+              <a class="mini-pill apple" href="${esc(appleUrl(t))}" target="_blank" rel="noopener">Apple Music</a>
+            </div>
+          </div>
+          <button class="icon-btn" data-action="disc-hide" data-id="${esc(t.id)}" aria-label="Not for me">${icon('x')}</button>
+          <div class="disc-progress"></div>
+        </div>`).join('')}</div>`).join('')
+      : `<p class="muted center">${discoverLoading ? 'Finding songs you might like…' : configured() ? 'Play some music first, then come back for suggestions.' : 'Connect your server in Settings to get suggestions.'}</p>`}`;
+}
+
+async function hideDiscover(id) {
+  discoverHidden.add(id);
+  db.put('kv', [...discoverHidden].slice(-2000), 'discoverHidden');
+  if (preview.dataset.id === id) preview.pause();
+  if (state.discover) {
+    state.discover.groups = state.discover.groups.map((g) => ({ ...g, tracks: g.tracks.filter((t) => t.id !== id) })).filter((g) => g.tracks.length);
+    db.put('kv', state.discover, 'discover');
+  }
+  refreshDiscover();
+  toast('Got it — hidden');
+}
+
+// The 30-second preview player (separate from your own music).
+const preview = new Audio();
+preview.preload = 'none';
+function playPreview(id) {
+  if (preview.dataset.id === id && !preview.paused) { preview.pause(); return; }
+  if (player.playing) player.toggle();
+  if (preview.dataset.id !== id) { preview.src = api.previewUrl(state.settings, id); preview.dataset.id = id; }
+  preview.play().catch(() => toast("Couldn't play that preview"));
+  paintPreview();
+}
+function paintPreview() {
+  const playing = !preview.paused;
+  $$('.disc-row').forEach((row) => {
+    const on = row.dataset.disc === preview.dataset.id;
+    row.classList.toggle('playing', on && playing);
+    row.querySelector('.disc-play').innerHTML = icon(on && playing ? 'pause' : 'play');
+    if (!on) row.style.removeProperty('--p');
+  });
+}
+preview.addEventListener('play', paintPreview);
+preview.addEventListener('pause', paintPreview);
+preview.addEventListener('timeupdate', () => {
+  const row = $(`.disc-row[data-disc="${CSS.escape(preview.dataset.id || '')}"]`);
+  if (row) row.style.setProperty('--p', `${(preview.currentTime / (preview.duration || 30)) * 100}%`);
+});
+preview.addEventListener('ended', () => { // carry on with the next suggestion
+  const all = discoverTracks();
+  const i = all.findIndex((t) => t.id === preview.dataset.id);
+  if (state.view.name === 'discover' && all[i + 1]) playPreview(all[i + 1].id);
+  else paintPreview();
+});
+preview.addEventListener('error', () => { if (preview.dataset.id) toast("Couldn't play that preview"); });
+
 // ---------- song info: check & fix the whole library ----------
 const missingGenre = (t) => !t.genre;
 const missingCover = (t) => !t.cover;
@@ -1603,6 +1756,7 @@ function renderList() {
     listIds = ts.map((t) => t.id);
     el.innerHTML = ts.map((t, i) => rowHTML(t, i)).join('');
   } else if (state.view.name === 'library') {
+    renderDiscoverRow();
     renderMixes();
     renderRecent();
     const ts = libraryTracks();
@@ -2146,6 +2300,10 @@ function bindEvents() {
         state.view = { name: 'library' };
         renderView();
         break;
+      case 'open-discover': state.view = { name: 'discover' }; renderView(); window.scrollTo(0, 0); if (el.dataset.id) { playPreview(el.dataset.id); $(`.disc-row[data-disc="${CSS.escape(el.dataset.id)}"]`)?.scrollIntoView({ block: 'center' }); } break;
+      case 'disc-play': playPreview(el.dataset.id); break;
+      case 'disc-hide': hideDiscover(el.dataset.id); break;
+      case 'disc-refresh': loadDiscover(true); break;
       case 'save-mix': { const mx = findMix(state.view.id); if (mx) saveMix(mx); break; }
       case 'queue-up': player.moveUp(Number(el.dataset.pos)); break;
       case 'queue-remove': player.removeAt(Number(el.dataset.pos)); break;
@@ -2274,6 +2432,7 @@ function bindEvents() {
   });
   player.audio.addEventListener('playing', () => {
     if (player.isSilent || !player.currentId) return;
+    if (!preview.paused) preview.pause();
     markPlayed(player.currentId);
     addRecent(player.context || { type: 'track', id: player.currentId });
   });
@@ -2327,6 +2486,8 @@ async function init() {
   ]);
   if (Array.isArray(recent)) state.recent = recent;
   state.artistPhotos = (await db.get('kv', 'artistPhotos')) || {};
+  state.discover = (await db.get('kv', 'discover')) || null;
+  discoverHidden = new Set((await db.get('kv', 'discoverHidden')) || []);
   tracks.forEach((t) => state.tracks.set(t.id, t));
   state.downloaded = new Set(blobKeys);
   if (playlists) state.playlists = playlists;

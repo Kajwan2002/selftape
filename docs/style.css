@@ -387,3 +387,23 @@ body.has-mini .view { padding-bottom: calc(var(--tabs-h) + var(--mini-h) + var(-
 .stats span { font-size: 11px; color: var(--muted); }
 .stats .warn b { color: var(--accent); }
 .sheet-head .s { white-space: pre-line; }
+
+/* discover */
+.section-head { display: flex; align-items: baseline; justify-content: space-between; }
+.section-head .link { background: none; border: 0; color: var(--muted); font: inherit; font-size: 14px; padding: 4px 0; cursor: pointer; }
+.disc-art, .disc-cover { background: var(--surface-2) center / cover no-repeat; position: relative; }
+.disc-play { position: absolute; right: 6px; bottom: 6px; width: 30px; height: 30px; border-radius: 50%; background: rgba(0,0,0,.55); color: #fff; display: grid; place-items: center; }
+.disc-play svg { width: 16px; height: 16px; }
+.disc-because { margin-top: 18px; font-weight: 500; }
+.disc-because b { font-weight: 700; }
+.disc-row { position: relative; align-items: center; overflow: hidden; }
+.disc-cover { flex: none; width: 64px; height: 64px; border-radius: 10px; border: 0; padding: 0; cursor: pointer; }
+.disc-cover .disc-play { right: 50%; bottom: 50%; transform: translate(50%, 50%); }
+.disc-row.playing .disc-cover .disc-play { background: var(--accent); color: var(--accent-ink); }
+.disc-links { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+.mini-pill { font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 999px; text-decoration: none; background: var(--surface-2); color: var(--text, inherit); }
+.mini-pill.spotify { background: #1db95422; color: #1ed760; }
+.mini-pill.apple { background: #fa2d4822; color: #ff4e66; }
+.disc-progress { position: absolute; left: 0; bottom: 0; height: 2px; width: var(--p, 0%); background: var(--accent); transition: width .25s linear; }
+.disc-row:not(.playing) .disc-progress { opacity: .35; }
+.center { text-align: center; padding: 24px 0; }
