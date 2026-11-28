@@ -21,6 +21,7 @@ const ICONS = {
   'chevron-right': line('<path d="m9 18 6-6-6-6"/>'),
   library: line('<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>'),
   playlists: line('<path d="M3 6h12M3 11h12M3 16h7"/><path d="M17 18V9l4-1"/><circle cx="15" cy="18" r="2"/>'),
+  discover: line('<circle cx="12" cy="12" r="9"/><path d="m15.5 8.5-2 5-5 2 2-5z"/>'),
   settings: line('<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/>'),
   trash: line('<path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="m19 6-1 14H6L5 6"/>'),
   edit: line('<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>'),

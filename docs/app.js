@@ -3,7 +3,7 @@ import * as api from './api.js';
 import { player } from './player.js';
 import { icon } from './icons.js';
 
-const APP_VERSION = 'v22'; // keep in sync with VERSION in sw.js
+const APP_VERSION = 'v23'; // keep in sync with VERSION in sw.js
 
 // ---------- helpers ----------
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -701,7 +701,7 @@ function render() {
 }
 
 function renderTabs() {
-  const active = state.view.name === 'playlist' ? 'playlists' : ['artist', 'mix', 'discover'].includes(state.view.name) ? 'library' : state.view.name;
+  const active = state.view.name === 'playlist' ? 'playlists' : ['artist', 'mix'].includes(state.view.name) ? 'library' : state.view.name;
   $('#importBtn').hidden = state.view.name !== 'library';
   $$('.tabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === active));
 }
@@ -726,7 +726,7 @@ function renderView() {
     hydrateCovers(el);
     renderList();
   } else if (v.name === 'discover') {
-    $('#pageTitle').textContent = 'Library';
+    $('#pageTitle').textContent = 'Discover';
     el.innerHTML = discoverHTML();
     if (!state.discover?.groups?.length) loadDiscover();
   } else if (v.name === 'artist') {
@@ -768,7 +768,6 @@ function libraryHTML() {
       <button data-action="lib-tab" data-lib="songs" class="${songs ? 'on' : ''}">Songs</button>
       <button data-action="lib-tab" data-lib="artists" class="${songs ? '' : 'on'}">Artists</button>
     </div>
-    <div id="discover"></div>
     <div id="mixes"></div>
     <div id="recent"></div>
     ${songs ? `<div class="actions-row">
@@ -1367,7 +1366,7 @@ async function saveMix(mx) {
 state.discover = null; // { day, groups: [{ because, tracks }], links: { id: appleUrl } }
 let discoverHidden = new Set();
 let discoverLoading = false;
-const todayKey = () => new Date().toISOString().slice(0, 10);
+const todayKey = () => new Date().toLocaleDateString('en-CA'); // your local date, YYYY-MM-DD
 const flatKey = (s) => String(s || '').toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/\(.*?\)|\[.*?\]/g, '').replace(/[^\p{L}\p{N}]+/gu, '');
 const discoverTracks = () => (state.discover?.groups || []).flatMap((g) => g.tracks);
 
@@ -1440,9 +1439,8 @@ const appleUrl = (t) => state.discover?.links?.[t.id] || `https://music.apple.co
 function discoverHTML() {
   const groups = state.discover?.groups || [];
   return `
-    <button class="back" data-action="back-library">${icon('chevron-left')} Library</button>
     <div class="pl-head disc-head">
-      <div class="meta"><h2>Discover</h2>
+      <div class="meta">
         <div class="muted small">Songs you don't have yet, picked from what you listen to. Tap to hear 30 seconds — like it? Save it in Spotify or Apple Music. New picks every day.</div></div>
     </div>
     <div class="actions-row"><button class="pill" data-action="disc-refresh" ${discoverLoading ? 'disabled' : ''}>${icon('sync')} ${discoverLoading ? 'Finding songs…' : 'New picks'}</button></div>
@@ -1756,7 +1754,6 @@ function renderList() {
     listIds = ts.map((t) => t.id);
     el.innerHTML = ts.map((t, i) => rowHTML(t, i)).join('');
   } else if (state.view.name === 'library') {
-    renderDiscoverRow();
     renderMixes();
     renderRecent();
     const ts = libraryTracks();
