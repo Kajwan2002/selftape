@@ -3,7 +3,7 @@ import * as api from './api.js';
 import { player } from './player.js';
 import { icon } from './icons.js';
 
-const APP_VERSION = 'v27'; // keep in sync with VERSION in sw.js
+const APP_VERSION = 'v28'; // keep in sync with VERSION in sw.js
 
 // ---------- helpers ----------
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -2296,22 +2296,42 @@ function form(title, fields, submitLabel = 'Save') {
   });
 }
 
+// lower-case, no accents or punctuation: "Guns N' Roses" -> "guns n roses"
+const findText = (s) => String(s || '').toLowerCase().normalize('NFKD').replace(/[̀-ͯ]/g, '').replace(/[’'`]/g, '').replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+
 function picker(title, tracks) {
   return new Promise((resolve) => {
     openSheet(`
       <div class="sheet-head"><div class="t">${esc(title)}</div></div>
-      <div class="pick-list">${tracks.map((t) => `<label class="row pick"><input type="checkbox" value="${t.id}">${art(t.id, t.title)}<div class="meta"><div class="t">${esc(t.title)}</div><div class="s">${esc(t.artist || fmtTime(t.duration))}</div></div></label>`).join('')}</div>
+      <label class="search pick-search">${icon('search')}<input type="search" placeholder="Search songs or artists" autocomplete="off" autocorrect="off"></label>
+      <div class="pick-list">${tracks.map((t) => `<label class="row pick" data-find="${esc(findText(`${t.title} ${t.artist || ''}`))}"><input type="checkbox" value="${t.id}">${art(t.id, t.title)}<div class="meta"><div class="t">${esc(t.title)}</div><div class="s">${esc(t.artist || fmtTime(t.duration))}</div></div></label>`).join('')}</div>
       <div class="sheet-foot"><button class="pill" data-cancel>Cancel</button><button class="pill primary" data-done>Add</button></div>`, resolve);
     const sheet = $('#sheet');
     hydrateCovers(sheet);
     sheet.onclick = null;
     const done = sheet.querySelector('[data-done]');
     sheet.onchange = () => {
-      const n = sheet.querySelectorAll('input:checked').length;
+      const n = sheet.querySelectorAll('.row.pick input:checked').length;
       done.textContent = n ? `Add ${n}` : 'Add';
     };
+    // type to narrow the list down (ticked songs stay ticked while you search)
+    const rows = [...sheet.querySelectorAll('.row.pick')];
+    const box = sheet.querySelector('.pick-search input');
+    const list = sheet.querySelector('.pick-list');
+    let empty = null;
+    box.oninput = () => {
+      const words = findText(box.value).split(' ').filter(Boolean);
+      let shown = 0;
+      // each word must appear, or be a near-miss of a word in the song (typos like "metalica")
+      const fits = (text, w) => text.includes(w) || (w.length >= 4 && text.split(' ').some((x) => x.length >= 4 && textSimilarity(x.slice(0, w.length + 1), w) >= 0.75));
+      for (const r of rows) { const ok = words.every((w) => fits(r.dataset.find, w)); r.hidden = !ok; if (ok) shown++; }
+      if (!shown && !empty) { empty = document.createElement('p'); empty.className = 'muted center'; empty.textContent = 'No songs match'; list.append(empty); }
+      if (empty) empty.hidden = !!shown;
+      list.scrollTop = 0;
+    };
+    box.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); box.blur(); } };
     sheet.querySelector('[data-cancel]').onclick = () => closeSheet(null);
-    done.onclick = () => closeSheet([...sheet.querySelectorAll('input:checked')].map((i) => i.value));
+    done.onclick = () => closeSheet([...sheet.querySelectorAll('.row.pick input:checked')].map((i) => i.value));
   });
 }
 
